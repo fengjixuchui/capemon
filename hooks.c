@@ -1207,28 +1207,6 @@ hook_t office_hooks[] = {
 	HOOK(ncrypt, NCryptImportKey),
 	HOOK(ncrypt, NCryptDecrypt),
 	HOOK(ncrypt, NCryptEncrypt),
-	// needed due to the DLL being delay-loaded in some cases
-	HOOK(cryptsp, CryptAcquireContextA),
-	HOOK(cryptsp, CryptAcquireContextW),
-	HOOK(cryptsp, CryptProtectData),
-	HOOK(cryptsp, CryptUnprotectData),
-	HOOK(cryptsp, CryptProtectMemory),
-	HOOK(cryptsp, CryptUnprotectMemory),
-	HOOK(cryptsp, CryptDecrypt),
-	HOOK(cryptsp, CryptEncrypt),
-	HOOK(cryptsp, CryptHashData),
-	HOOK(cryptsp, CryptDecodeMessage),
-	HOOK(cryptsp, CryptDecryptMessage),
-	HOOK(cryptsp, CryptEncryptMessage),
-	HOOK(cryptsp, CryptHashMessage),
-	HOOK(cryptsp, CryptExportKey),
-	HOOK(cryptsp, CryptGenKey),
-	HOOK(cryptsp, CryptCreateHash),
-	HOOK(cryptsp, CryptEnumProvidersA),
-	HOOK(cryptsp, CryptEnumProvidersW),
-	HOOK(cryptsp, CryptHashSessionKey),
-	HOOK(cryptsp, CryptGenRandom),
-	HOOK(cryptsp, CryptImportKey),
 };
 
 hook_t ie_hooks[] = {
@@ -1421,8 +1399,8 @@ void set_hooks()
         {
             g_config.firefox = 1;
             g_config.injection = 0;
-            g_config.compression = 0;
-            g_config.caller_dump = 0;
+			g_config.unpacker = 0;
+            g_config.caller_regions = 0;
             g_config.api_rate_cap = 0;
             g_config.yarascan = 0;
             g_config.ntdll_protect = 0;
@@ -1434,7 +1412,6 @@ void set_hooks()
         {
             g_config.iexplore = 1;
             g_config.injection = 0;
-            g_config.compression = 0;
             g_config.api_rate_cap = 0;
             g_config.ntdll_protect = 0;
             g_config.yarascan = 0;
@@ -1444,7 +1421,8 @@ void set_hooks()
 		if (strstr(our_process_path, "Microsoft Office"))
         {
 			g_config.office = 1;
-			g_config.caller_dump = 0;
+			g_config.unpacker = 0;
+			g_config.caller_regions = 0;
 			g_config.injection = 0;
 			g_config.yarascan = 0;
 			g_config.ntdll_protect = 0;
@@ -1520,14 +1498,16 @@ void set_hooks()
 		}
 		else if (!_stricmp(our_process_name, "services.exe")) {
 			g_config.yarascan = 0;
-			g_config.caller_dump = 0;
+			g_config.unpacker = 0;
+			g_config.caller_regions = 0;
 			g_config.injection = 0;
 			g_config.minhook = 1;
 			DebugOutput("services.exe hook set enabled\n");
 		}
 		else if (!_stricmp(our_process_name, "svchost.exe") && wcsstr(our_commandline, L"-k DcomLaunch") || wcsstr(our_commandline, L"-k netsvcs")) {
 			g_config.yarascan = 0;
-			g_config.caller_dump = 0;
+			g_config.unpacker = 0;
+			g_config.caller_regions = 0;
 			g_config.injection = 0;
 			g_config.minhook = 1;
 			DebugOutput("Service host hook set enabled\n");
