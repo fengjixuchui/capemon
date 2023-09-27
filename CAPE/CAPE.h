@@ -24,6 +24,8 @@ extern CHAR s_szDllPath[MAX_PATH];
 #define PE_MAX_SECTIONS 0xFFFF
 #define REGISTRY_VALUE_SIZE_MIN 1024
 
+typedef PVOID(WINAPI *_getJit)(void);
+
 void DebugOutput(_In_ LPCTSTR lpOutputString, ...);
 void DebuggerOutput(_In_ LPCTSTR lpOutputString, ...);
 void ErrorOutput(_In_ LPCTSTR lpOutputString, ...);
@@ -63,7 +65,7 @@ int DumpImageInCurrentProcess(PVOID ImageBase);
 void DumpSectionViewsForPid(DWORD Pid);
 BOOL DumpStackRegion(void);
 
-BOOL ProcessDumped, ModuleDumped;
+BOOL ProcessDumped;
 
 SYSTEM_INFO SystemInfo;
 PVOID CallingModule;
@@ -133,18 +135,15 @@ enum {
 	STACK_REGION = 0x6c,
 
 	TYPE_STRING = 0x100,
-
-	UPX = 0x1000
 };
 
 typedef struct TrackedRegion
 {
 	PVOID						AllocationBase;
-	PVOID						ProtectAddress;
+	PVOID						Address;
 	MEMORY_BASIC_INFORMATION	MemInfo;
 	BOOL						Committed;
 	BOOL						PagesDumped;
-	BOOL						CallerDetected;
 	BOOL						CanDump;
 	DWORD						EntryPoint;
 	double						Entropy;

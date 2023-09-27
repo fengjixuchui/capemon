@@ -598,13 +598,17 @@ DWORD pid_from_process_handle(HANDLE process_handle)
 
 	memset(&pbi, 0, sizeof(pbi));
 
-	duped = DuplicateHandle(GetCurrentProcess(), process_handle, GetCurrentProcess(), &dup_handle, PROCESS_QUERY_INFORMATION, FALSE, 0);
-
-	if (pNtQueryInformationProcess(dup_handle, 0, &pbi, sizeof(pbi), &ulSize) >= 0 && ulSize == sizeof(pbi))
+	if (pNtQueryInformationProcess(process_handle, 0, &pbi, sizeof(pbi), &ulSize) >= 0 && ulSize == sizeof(pbi))
 		PID = (DWORD)pbi.UniqueProcessId;
+	else {
+		duped = DuplicateHandle(GetCurrentProcess(), process_handle, GetCurrentProcess(), &dup_handle, PROCESS_QUERY_INFORMATION, FALSE, 0);
 
-	if (duped)
-		CloseHandle(dup_handle);
+		if (pNtQueryInformationProcess(dup_handle, 0, &pbi, sizeof(pbi), &ulSize) >= 0 && ulSize == sizeof(pbi))
+			PID = (DWORD)pbi.UniqueProcessId;
+
+		if (duped)
+			CloseHandle(dup_handle);
+	}
 
 out:
 	set_lasterrors(&lasterror);
@@ -625,16 +629,22 @@ static BOOL cid_from_thread_handle(HANDLE thread_handle, PCLIENT_ID cid)
 
 	memset(&tbi, 0, sizeof(tbi));
 
-	duped = DuplicateHandle(GetCurrentProcess(), thread_handle, GetCurrentProcess(), &dup_handle, THREAD_QUERY_INFORMATION, FALSE, 0);
+	if (pNtQueryInformationThread(thread_handle, 0, &tbi, sizeof(tbi), &ulSize) >= 0 && ulSize == sizeof(tbi)) {
+		memcpy(cid, &tbi.ClientId, sizeof(CLIENT_ID));
+		ret = TRUE;
+	}
+	else {
+		duped = DuplicateHandle(GetCurrentProcess(), thread_handle, GetCurrentProcess(), &dup_handle, THREAD_QUERY_INFORMATION, FALSE, 0);
 
-	if (duped) {
-        if (pNtQueryInformationThread(dup_handle, 0, &tbi, sizeof(tbi), &ulSize) >= 0 && ulSize == sizeof(tbi)) {
-            memcpy(cid, &tbi.ClientId, sizeof(CLIENT_ID));
-            ret = TRUE;
-        }
+		if (duped) {
+			if (pNtQueryInformationThread(dup_handle, 0, &tbi, sizeof(tbi), &ulSize) >= 0 && ulSize == sizeof(tbi)) {
+				memcpy(cid, &tbi.ClientId, sizeof(CLIENT_ID));
+				ret = TRUE;
+			}
 
-		CloseHandle(dup_handle);
-    }
+			CloseHandle(dup_handle);
+		}
+	}
 
 	set_lasterrors(&lasterror);
 
@@ -737,9 +747,10 @@ void add_dll_range(ULONG_PTR start, ULONG_PTR end)
 BOOL is_in_dll_range(ULONG_PTR addr)
 {
 	DWORD i;
-	for (i = 0; i < loaded_dlls; i++)
+	for (i = 0; i < loaded_dlls; i++) {
 		if (addr >= dll_ranges[i].start && addr < dll_ranges[i].end)
 			return TRUE;
+	}
 	return FALSE;
 }
 
@@ -771,17 +782,15 @@ void add_all_dlls_to_dll_ranges(void)
 		pListEntry = pListEntry->Flink)
 	{
 		mod = CONTAINING_RECORD(pListEntry, LDR_DATA_TABLE_ENTRY, InLoadOrderModuleList);
+		ModulePath.MaximumLength = ModulePath.Length = mod->FullDllName.Length - mod->BaseDllName.Length;
+		ModulePath.Buffer = calloc(ModulePath.Length/sizeof(WCHAR) + 1, sizeof(WCHAR));
+		memcpy(ModulePath.Buffer, mod->FullDllName.Buffer, ModulePath.Length);
 		// skip dlls in same directory as exe
-		if (!path_is_system(ProcessPath.Buffer)) {
-			ModulePath.MaximumLength = ModulePath.Length = mod->FullDllName.Length - mod->BaseDllName.Length;
-			ModulePath.Buffer = calloc(ModulePath.Length/sizeof(WCHAR) + 1, sizeof(WCHAR));
-			memcpy(ModulePath.Buffer, mod->FullDllName.Buffer, ModulePath.Length);
-			if (pRtlEqualUnicodeString(&ProcessPath, &ModulePath, FALSE) || (ULONG_PTR)mod->BaseAddress == base_of_dll_of_interest) {
-				free(ModulePath.Buffer);
-				continue;
-			}
+		if (!path_is_system(ModulePath.Buffer) && pRtlEqualUnicodeString(&ProcessPath, &ModulePath, FALSE) || (ULONG_PTR)mod->BaseAddress == base_of_dll_of_interest) {
 			free(ModulePath.Buffer);
+			continue;
 		}
+		free(ModulePath.Buffer);
 		add_dll_range((ULONG_PTR)mod->BaseAddress, (ULONG_PTR)mod->BaseAddress + mod->SizeOfImage);
 	}
 
@@ -2045,6 +2054,23 @@ BOOLEAN is_address_in_ntdll(ULONG_PTR address)
 	return FALSE;
 }
 
+BOOLEAN is_image_base_remapped(HMODULE BaseAddress)
+{
+	BOOL remapped = FALSE;
+	wchar_t *filepath = malloc(MAX_PATH * sizeof(wchar_t));
+	GetMappedFileNameW(GetCurrentProcess(), BaseAddress, filepath, MAX_PATH);
+
+	wchar_t *absolutepath = malloc(32768 * sizeof(wchar_t));
+	ensure_absolute_unicode_path(absolutepath, filepath);
+	free(filepath);
+
+	if (wcsicmp(our_process_path_w, absolutepath))
+		remapped = TRUE;
+
+	free(absolutepath);
+	return remapped;
+}
+
 ULONG_PTR win32u_base;
 DWORD win32u_size;
 
@@ -2087,6 +2113,7 @@ void prevent_module_reloading(PVOID *BaseAddress) {
 	wchar_t *whitelist[] = {
 		L"C:\\Windows\\System32\\ntdll.dll",
 		L"C:\\Windows\\SysWOW64\\ntdll.dll",
+		L"C:\\Windows\\sysnative\\ntdll.dll",
 		NULL
 	};
 
@@ -2104,11 +2131,14 @@ void prevent_module_reloading(PVOID *BaseAddress) {
 		if (!wcsicmp(whitelist[i], absolutepath)) {
 			// is this a loaded module?
 			HMODULE address = GetModuleHandleW(absolutepath);
-			if (address != NULL) {
-				DebugOutput("Sample attempted to remap module '%ws' at 0x%p, returning original module address instead: 0x%p", absolutepath, *BaseAddress, address);
-				pNtUnmapViewOfSection(GetCurrentProcess(), *BaseAddress);
-				*BaseAddress = (LPVOID)address;
-			}
+			if (address == NULL)
+				address = GetModuleHandleW(get_dll_basename(absolutepath));
+			if (address == NULL)
+				continue;
+			DebugOutput("Sample attempted to remap module '%ws' at 0x%p, returning original module address instead: 0x%p", absolutepath, *BaseAddress, address);
+			pNtUnmapViewOfSection(GetCurrentProcess(), *BaseAddress);
+			*BaseAddress = (LPVOID)address;
+			g_config.ntdll_protect = 0;
 			break;
 		}
 	}

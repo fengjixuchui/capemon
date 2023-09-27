@@ -589,6 +589,16 @@ HOOKDEF(BOOL, WINAPI, GetComputerNameW,
 	return ret;
 }
 
+HOOKDEF(BOOL, WINAPI, GetComputerNameExW,
+	__in	int NameType,
+	__out	LPWSTR lpBuffer,
+	__out	LPDWORD nSize
+) {
+	BOOL ret = Old_GetComputerNameExW(NameType, lpBuffer, nSize);
+	LOQ_bool("misc", "u", "ComputerName", lpBuffer);
+	return ret;
+}
+
 HOOKDEF(BOOL, WINAPI, GetUserNameA,
 	_Out_	LPSTR lpBuffer,
 	_Inout_  LPDWORD lpnSize
@@ -720,7 +730,9 @@ HOOKDEF(NTSTATUS, WINAPI, NtSetInformationProcess,
 	__in PVOID ProcessInformation,
 	__in ULONG ProcessInformationLength
 ) {
-	NTSTATUS ret = Old_NtSetInformationProcess(ProcessHandle, ProcessInformationClass, ProcessInformation, ProcessInformationLength);
+	NTSTATUS ret = 0;
+	if (!g_config.syscall || ProcessInformationClass != ProcessInstrumentationCallback)
+		ret = Old_NtSetInformationProcess(ProcessHandle, ProcessInformationClass, ProcessInformation, ProcessInformationLength);
 	if ((ProcessInformationClass == ProcessExecuteFlags || ProcessInformationClass == ProcessBreakOnTermination) && ProcessInformationLength == 4)
 		LOQ_ntstatus("process", "ii", "ProcessInformationClass", ProcessInformationClass, "ProcessInformation", *(int*)ProcessInformation);
 	else
@@ -1161,12 +1173,7 @@ HOOKDEF(void, WINAPIV, memcpy,
    size_t count
 )
 {
-	int ret = 0;	// needed for LOQ_void
-
 	Old_memcpy(dest, src, count);
-
-	if (count > 0xa00)
-		LOQ_void("misc", "bppi", "DestinationBuffer", count, dest, "source", src, "destination", dest, "count", count);
 
 	if ((g_config.plugx || CompressedPE) && !PlugXConfigDumped &&
 	(
@@ -1192,6 +1199,7 @@ HOOKDEF(void, WINAPIV, memcpy,
 		DumpMemoryRaw((BYTE*)src, count);
 		PlugXConfigDumped = TRUE;
 	}
+
 	return;
 }
 
@@ -1272,13 +1280,13 @@ HOOKDEF(HRSRC, WINAPI, FindResourceExW,
 
 	wchar_t type_id[8];
 	if (IS_INTRESOURCE(lpType)) {
-		swprintf(type_id, sizeof type_id, L"#%hu", (WORD)lpType);
+		swprintf_s(type_id, sizeof(type_id), L"#%hu", (WORD)lpType);
 		lpType = type_id;
 	}
 
 	wchar_t name_id[8];
 	if (IS_INTRESOURCE(lpName)) {
-		swprintf(name_id, sizeof name_id, L"#%hu", (WORD)lpName);
+		swprintf_s(name_id, sizeof(name_id), L"#%hu", (WORD)lpName);
 		lpName = name_id;
 	}
 

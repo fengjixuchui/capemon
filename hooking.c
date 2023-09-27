@@ -52,11 +52,6 @@ extern BOOL BreakpointsSet;
 extern PVOID ImageBase;
 extern BOOLEAN g_dll_main_complete;
 
-void hook_init()
-{
-	lookup_init(&g_caller_regions);
-}
-
 void emit_rel(unsigned char *buf, unsigned char *source, unsigned char *target)
 {
 	*(DWORD *)buf = (DWORD)(target - (source + 4));
@@ -96,8 +91,8 @@ static void caller_dispatch(hook_info_t *hookinfo, ULONG_PTR addr)
 	if (g_config.unpacker)
 	{
 		TrackedRegion = GetTrackedRegion((PVOID)AllocationBase);
-		if (TrackedRegion && (TrackedRegion->CallerDetected || TrackedRegion->PagesDumped))
-			return;	
+		if (TrackedRegion && (TrackedRegion->Address || TrackedRegion->PagesDumped))
+			return;
 		if (!TrackedRegion) {
 			TrackedRegion = AddTrackedRegion((PVOID)AllocationBase, 0);
 			if (!TrackedRegion) {
@@ -106,7 +101,7 @@ static void caller_dispatch(hook_info_t *hookinfo, ULONG_PTR addr)
 			}
 			DebugOutput("caller_dispatch: Added region at 0x%p to tracked regions list (%ws::%s returns to 0x%p, thread %d).\n", AllocationBase, hookinfo->current_hook->library, hookinfo->current_hook->funcname, addr, GetCurrentThreadId());
 		}
-		TrackedRegion->CallerDetected = TRUE;
+		TrackedRegion->Address = (PVOID)addr;
 	}
 	if (g_config.caller_regions) {
 		if (lookup_get(&g_caller_regions, (ULONG_PTR)AllocationBase, 0))
@@ -211,6 +206,8 @@ int called_by_hook(void)
 	return __called_by_hook(hookinfo->stack_pointer, hookinfo->frame_pointer);
 }
 
+BOOL ModuleDumped;
+
 void api_dispatch(hook_t *h, hook_info_t *hookinfo)
 {
 	unsigned int i;
@@ -301,7 +298,7 @@ int WINAPI enter_hook(hook_t *h, ULONG_PTR sp, ULONG_PTR ebp_or_rip)
 	if (h->new_func == &New_NtAllocateVirtualMemory) {
 		lasterror_t lasterrors;
 		get_lasterrors(&lasterrors);
-		if (lookup_get_no_cs(&g_hook_info, (ULONG_PTR)GetCurrentThreadId(), NULL) == NULL && (!tmphookinfo_threadid || tmphookinfo_threadid != GetCurrentThreadId())) {
+		if (lookup_get(&g_hook_info, (ULONG_PTR)GetCurrentThreadId(), NULL) == NULL && (!tmphookinfo_threadid || tmphookinfo_threadid != GetCurrentThreadId())) {
 			memset(&tmphookinfo, 0, sizeof(tmphookinfo));
 			tmphookinfo_threadid = GetCurrentThreadId();
 		}
@@ -377,9 +374,9 @@ hook_info_t *hook_info()
 
 	get_lasterrors(&lasterror);
 
-	ptr = (hook_info_t *)lookup_get_no_cs(&g_hook_info, (ULONG_PTR)GetCurrentThreadId(), NULL);
+	ptr = (hook_info_t *)lookup_get(&g_hook_info, (ULONG_PTR)GetCurrentThreadId(), NULL);
 	if (ptr == NULL) {
-		ptr = lookup_add_no_cs(&g_hook_info, (ULONG_PTR)GetCurrentThreadId(), sizeof(hook_info_t));
+		ptr = lookup_add(&g_hook_info, (ULONG_PTR)GetCurrentThreadId(), sizeof(hook_info_t));
 		memset(ptr, 0, sizeof(*ptr));
 	}
 
@@ -390,11 +387,17 @@ hook_info_t *hook_info()
 
 void get_lasterrors(lasterror_t *errors)
 {
-	char *teb;
+	char *teb = NULL;
 
 	errors->Eflags = (DWORD)__readeflags();
 
 	teb = (char *)NtCurrentTeb();
+
+	if (teb == NULL) {
+		errors->Win32Error = -1;
+		errors->NtstatusError = -1;
+		return;
+	}
 
 	errors->Win32Error = *(DWORD *)(teb + TLS_LAST_WIN32_ERROR);
 	errors->NtstatusError = *(DWORD *)(teb + TLS_LAST_NTSTATUS_ERROR);
@@ -404,6 +407,9 @@ void get_lasterrors(lasterror_t *errors)
 void set_lasterrors(lasterror_t *errors)
 {
 	char *teb = (char *)NtCurrentTeb();
+
+	if (teb == NULL)
+		return;
 
 	*(DWORD *)(teb + TLS_LAST_WIN32_ERROR) = errors->Win32Error;
 	*(DWORD *)(teb + TLS_LAST_NTSTATUS_ERROR) = errors->NtstatusError;

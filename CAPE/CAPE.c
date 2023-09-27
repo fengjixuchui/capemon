@@ -109,6 +109,7 @@ typedef struct _hook_info_t {
 	ULONG_PTR parent_caller_retaddr;
 } hook_info_t;
 
+extern BOOLEAN is_image_base_remapped(HMODULE BaseAddress);
 extern uint32_t path_from_handle(HANDLE handle, wchar_t *path, uint32_t path_buffer_len);
 extern wchar_t *ensure_absolute_unicode_path(wchar_t *out, const wchar_t *in);
 extern int called_by_hook(void);
@@ -136,14 +137,15 @@ extern int ScyllaDumpProcess(HANDLE hProcess, DWORD_PTR ModuleBase, DWORD_PTR Ne
 extern int ScyllaDumpPE(DWORD_PTR Buffer);
 extern SIZE_T GetPESize(PVOID Buffer);
 extern PVOID GetReturnAddress(hook_info_t *hookinfo);
-extern PVOID CallingModule;
+extern PVOID CallingModule, ClrJIT;
 extern void UnpackerInit();
 extern BOOL SetInitialBreakpoints(PVOID ImageBase);
-extern BOOL UPXInitialBreakpoints(PVOID ImageBase);
 extern BOOL BreakpointsSet, TraceRunning;
+extern char* StringsFile;
+extern HANDLE Strings;
 
 OSVERSIONINFO OSVersion;
-BOOL ProcessDumped, ModuleDumped;
+BOOL ProcessDumped, ImageBaseRemapped;
 PVOID ImageBase;
 static unsigned int DumpCount;
 
@@ -541,12 +543,72 @@ SIZE_T GetAccessibleSize(PVOID Address)
 }
 
 //**************************************************************************************
+PVOID GetCLRAddress(HMODULE ModuleBase, PCHAR FunctionName)
+//**************************************************************************************
+{
+	PIMAGE_DOS_HEADER DosHeader;
+	PIMAGE_NT_HEADERS NtHeader;
+
+	if (!ModuleBase || !FunctionName)
+		return NULL;
+
+	if (!IsAddressAccessible(ModuleBase))
+	{
+#ifdef DEBUG_COMMENTS
+		DebugOutput("GetCLRAddress: 0x%p inaccessible\n", ModuleBase);
+#endif
+		return NULL;
+	}
+
+	if (*(WORD*)ModuleBase != IMAGE_DOS_SIGNATURE)
+		return NULL;
+
+	DosHeader = (PIMAGE_DOS_HEADER)ModuleBase;
+	NtHeader = (PIMAGE_NT_HEADERS)((PBYTE)DosHeader + DosHeader->e_lfanew);
+
+	if (!IsAddressAccessible(NtHeader))
+	{
+#ifdef DEBUG_COMMENTS
+		DebugOutput("GetCLRAddress: NT headers at 0x%p inaccessible\n", NtHeader);
+#endif
+		return NULL;
+	}
+
+	if (*(DWORD*)NtHeader != IMAGE_NT_SIGNATURE)
+		return NULL;
+
+	PIMAGE_SECTION_HEADER CodeSectionHeader = (PIMAGE_SECTION_HEADER)((PBYTE)ModuleBase + DosHeader->e_lfanew + FIELD_OFFSET(IMAGE_NT_HEADERS, OptionalHeader) + NtHeader->FileHeader.SizeOfOptionalHeader);
+	PVOID CodeSection = (PBYTE)ModuleBase + CodeSectionHeader->VirtualAddress;
+	PDWORD Pointer = (PDWORD)CodeSection;
+
+	while ((PBYTE)Pointer < (PBYTE)CodeSection + CodeSectionHeader->Misc.VirtualSize)
+	{
+		DWORD Marker = *Pointer;
+		if ((Marker & 0xFFFFFFFF) == 0xFFFF0000 || (Marker & 0xFFFFFFFF) == 0xFFFF0008)
+		{
+			PCHAR Name = (PCHAR)(DWORD_PTR)*(Pointer + 2);
+			if (Name && !strcmp(FunctionName, Name))
+			{
+#ifdef DEBUG_COMMENTS
+				DebugOutput("GetCLRAddress: Matched %s: 0x%p", FunctionName, *(Pointer + 1));
+#endif
+				return (PVOID)(DWORD_PTR)*(Pointer + 1);
+			}
+		}
+		Pointer++;
+	}
+
+	return NULL;
+}
+
+//**************************************************************************************
 PVOID GetExportAddress(HMODULE ModuleBase, PCHAR FunctionName)
 //**************************************************************************************
 {
 	PIMAGE_DOS_HEADER DosHeader;
 	PIMAGE_NT_HEADERS NtHeader;
 	PIMAGE_EXPORT_DIRECTORY ImageExportDirectory;
+	PVOID ExportAddress = NULL;
 
 	if (!ModuleBase || !FunctionName)
 		return NULL;
@@ -584,18 +646,54 @@ PVOID GetExportAddress(HMODULE ModuleBase, PCHAR FunctionName)
 	if (!ImageExportDirectory->AddressOfNames)
 		return NULL;
 
-	unsigned int *NameRVA = (unsigned int*)((PBYTE)ModuleBase + ImageExportDirectory->AddressOfNames);
-
-	for (unsigned int i = 0; i < ImageExportDirectory->NumberOfNames; i++)
+	if (ImageExportDirectory->AddressOfNames > NtHeader->OptionalHeader.SizeOfImage)
 	{
-		if (NameRVA[i])
-		{
-			if (!strcmp((PCHAR)((PBYTE)ModuleBase + NameRVA[i]), FunctionName))
-				return (PVOID)((PBYTE)ModuleBase + ((DWORD*)((PBYTE)ModuleBase + ImageExportDirectory->AddressOfFunctions))[((unsigned short*)((PBYTE)ModuleBase + ImageExportDirectory->AddressOfNameOrdinals))[i]]);
-		}
+#ifdef DEBUG_COMMENTS
+		DebugOutput("GetExportAddress: AddressOfNames 0x%x SizeOfImage 0x%x", ImageExportDirectory->AddressOfNames, NtHeader->OptionalHeader.SizeOfImage);
+#endif
+		return NULL;
 	}
 
-	return NULL;
+	unsigned int *NameRVA = (unsigned int*)((PBYTE)ModuleBase + ImageExportDirectory->AddressOfNames);
+
+	__try
+	{
+		for (unsigned int i = 0; i < ImageExportDirectory->NumberOfNames; i++)
+		{
+			if (NameRVA[i])
+			{
+				if (!strcmp((PCHAR)((PBYTE)ModuleBase + NameRVA[i]), FunctionName))
+					ExportAddress = (PVOID)((PBYTE)ModuleBase + ((DWORD*)((PBYTE)ModuleBase + ImageExportDirectory->AddressOfFunctions))[((unsigned short*)((PBYTE)ModuleBase + ImageExportDirectory->AddressOfNameOrdinals))[i]]);
+			}
+		}
+	}
+	__except(EXCEPTION_EXECUTE_HANDLER)
+	{
+		DebugOutput("GetExportAddress: Exception occurred around 0x%p\n", NameRVA);
+		return NULL;
+	}
+
+
+	if (!ExportAddress && ModuleBase == GetModuleHandle("clr"))
+		return GetCLRAddress(ModuleBase, FunctionName);
+
+	if (!ExportAddress && ModuleBase == GetModuleHandle("clrjit"))
+	{
+#ifdef DEBUG_COMMENTS
+		DebugOutput("GetExportAddress: Looking up %s\n", FunctionName);
+#endif
+		_getJit pgetJit;
+		*(FARPROC *)&pgetJit = GetExportAddress(ModuleBase, "getJit");
+		if (!pgetJit) {
+			DebugOutput("GetExportAddress: failed to resolve getJit\n");
+			return NULL;
+		}
+		PVOID** CILJitBuff = (PVOID**)pgetJit();
+		if (CILJitBuff)
+			ExportAddress = (unsigned char *)**CILJitBuff;
+	}
+
+	return ExportAddress;
 }
 
 //**************************************************************************************
@@ -605,7 +703,7 @@ BOOL IsAddressAccessible(PVOID Address)
 	MEMORY_BASIC_INFORMATION MemInfo;
 
 	if (!Address || Address > (PVOID)0x7fffffffffff)
-		return 0;
+		return FALSE;
 
 	if (!SystemInfo.dwPageSize)
 		GetSystemInfo(&SystemInfo);
@@ -613,7 +711,7 @@ BOOL IsAddressAccessible(PVOID Address)
 	if (!SystemInfo.dwPageSize)
 	{
 		ErrorOutput("IsAddressAccessible: Failed to obtain system page size.\n");
-		return 0;
+		return FALSE;
 	}
 
 	if (!VirtualQuery(Address, &MemInfo, sizeof(MEMORY_BASIC_INFORMATION)))
@@ -621,7 +719,7 @@ BOOL IsAddressAccessible(PVOID Address)
 #ifdef DEBUG_COMMENTS
 		ErrorOutput("IsAddressAccessible: unable to query memory address 0x%p", Address);
 #endif
-		return 0;
+		return FALSE;
 	}
 
 	if (!(MemInfo.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
@@ -756,7 +854,7 @@ PTRACKEDREGION AddTrackedRegion(PVOID Address, ULONG Protect)
 		TrackedRegion = TrackedRegion->NextTrackedRegion;
 	}
 
-	if (NumberOfTrackedRegions > 10)
+	if (NumberOfTrackedRegions > 100)
 		DebugOutput("AddTrackedRegion: DEBUG Warning - number of tracked regions %d.\n", NumberOfTrackedRegions);
 
 	if (GetPageAddress(Address) == GetPageAddress(TrackedRegionList))
@@ -804,7 +902,7 @@ PTRACKEDREGION AddTrackedRegion(PVOID Address, ULONG Protect)
 	TrackedRegion->AllocationBase = TrackedRegion->MemInfo.AllocationBase;
 
 	if (Address != TrackedRegion->AllocationBase)
-		TrackedRegion->ProtectAddress = Address;
+		TrackedRegion->Address = Address;
 
 	if (Protect)
 		TrackedRegion->MemInfo.Protect = Protect;
@@ -991,18 +1089,39 @@ void ProcessTrackedRegion(PTRACKEDREGION TrackedRegion)
 		return;
 	}
 
-	if (!TrackedRegion->CanDump && !TrackedRegion->CallerDetected && g_terminate_event_handle)
+	if (!TrackedRegion->CanDump && !TrackedRegion->Address && g_terminate_event_handle)
 		return;
 
-	if (!ScanForNonZero(TrackedRegion->AllocationBase, GetAccessibleSize(TrackedRegion->AllocationBase)))
+	PVOID BaseAddress = TrackedRegion->AllocationBase;
+	SIZE_T RegionSize = GetAccessibleSize(BaseAddress);
+
+	if (!RegionSize && TrackedRegion->Address)
+	{
+		BaseAddress = TrackedRegion->Address;
+		RegionSize = GetAccessibleSize(BaseAddress);
+		if (!RegionSize)
+		{
+#ifdef DEBUG_COMMENTS
+			DebugOutput("ProcessTrackedRegion: Region at 0x%p is empty\n", BaseAddress);
+#endif
+			return;
+		}
+	}
+
+	if (!ScanForNonZero(BaseAddress, RegionSize))
+	{
+#ifdef DEBUG_COMMENTS
+		DebugOutput("ProcessTrackedRegion: Region at 0x%p is empty\n", BaseAddress);
+#endif
 		return;
+	}
 
 	if (TrackedRegion->PagesDumped)
 	{
 		// Allow a big enough change in entropy to trigger another dump
 		if (TrackedRegion->EntryPoint && TrackedRegion->Entropy)
 		{
-			double Entropy = GetPEEntropy(TrackedRegion->AllocationBase);
+			double Entropy = GetPEEntropy(BaseAddress);
 			if (Entropy && (fabs(TrackedRegion->Entropy - Entropy) < (double)ENTROPY_DELTA))
 				return;
 		}
@@ -1015,35 +1134,38 @@ void ProcessTrackedRegion(PTRACKEDREGION TrackedRegion)
 	TraceRunning = FALSE;
 
 	if (g_config.yarascan)
-		YaraScan(TrackedRegion->AllocationBase, GetAccessibleSize(TrackedRegion->AllocationBase));
+		YaraScan(BaseAddress, RegionSize);
 
 	char ModulePath[MAX_PATH];
-	BOOL MappedModule = GetMappedFileName(GetCurrentProcess(), TrackedRegion->AllocationBase, ModulePath, MAX_PATH);
+	BOOL MappedModule = GetMappedFileName(GetCurrentProcess(), BaseAddress, ModulePath, MAX_PATH);
 	if (MappedModule)
+	{
+		DebugOutput("ProcessTrackedRegion: Region at 0x%p mapped as %s, skipping", BaseAddress, ModulePath);
 		return;
+	}
 
 	if (!CapeMetaData->DumpType)
 		CapeMetaData->DumpType = UNPACKED_SHELLCODE;
 
 	if (!CapeMetaData->Address)
-		CapeMetaData->Address = TrackedRegion->AllocationBase;
+		CapeMetaData->Address = BaseAddress;
 
-	TrackedRegion->PagesDumped = DumpRegion(TrackedRegion->AllocationBase);
+	TrackedRegion->PagesDumped = DumpRegion(BaseAddress);
 
 	if (TrackedRegion->PagesDumped)
 	{
 		if (TraceIsRunning)
-			DebuggerOutput("ProcessTrackedRegion: Dumped region at 0x%p.\n", TrackedRegion->AllocationBase);
+			DebuggerOutput("ProcessTrackedRegion: Dumped region at 0x%p.\n", BaseAddress);
 		else
-			DebugOutput("ProcessTrackedRegion: Dumped region at 0x%p.\n", TrackedRegion->AllocationBase);
+			DebugOutput("ProcessTrackedRegion: Dumped region at 0x%p.\n", BaseAddress);
 		ClearTrackedRegion(TrackedRegion);
 	}
 	else
 	{
 		if (TraceIsRunning)
-			DebuggerOutput("ProcessTrackedRegion: Failed to dump region at 0x%p.\n", TrackedRegion->AllocationBase);
+			DebuggerOutput("ProcessTrackedRegion: Failed to dump region at 0x%p.\n", BaseAddress);
 		else
-			DebugOutput("ProcessTrackedRegion: Failed to dump region at 0x%p.\n", TrackedRegion->AllocationBase);
+			DebugOutput("ProcessTrackedRegion: Failed to dump region at 0x%p.\n", BaseAddress);
 	}
 
 }
@@ -1249,6 +1371,15 @@ char* GetName()
 }
 
 //**************************************************************************************
+char* GetTempName()
+//**************************************************************************************
+{
+	char *FullPathName = GetResultsPath("CAPE");
+	PathAppend(FullPathName, "CapeOutput.bin");
+	return FullPathName;
+}
+
+//**************************************************************************************
 BOOL GetHash(unsigned char* Buffer, unsigned int Size, char* OutputFilenameBuffer)
 //**************************************************************************************
 {
@@ -1450,6 +1581,19 @@ int DumpXorPE(LPBYTE Buffer, unsigned int Size)
 	return FALSE;
 }
 
+void DumpStrings()
+{
+	if (Strings) {
+		CloseHandle(Strings);
+		Strings = NULL;
+		CapeMetaData->DumpType = 0;
+		if (g_config.typestring)
+			CapeMetaData->TypeString = g_config.typestring;
+		DebugOutput("DumpStrings: Uploading captured strings at %s\n", StringsFile);
+		CapeOutputFile(StringsFile);
+	}
+}
+
 //**************************************************************************************
 int ScanPageForNonZero(PVOID Address)
 //**************************************************************************************
@@ -1494,7 +1638,7 @@ SIZE_T ScanForAccess(PVOID Buffer, SIZE_T Size)
 //**************************************************************************************
 {
 	SIZE_T p, AllocationSize;
-	char c;
+	char c = 0;
 
 	if (!Buffer)
 	{
@@ -1822,10 +1966,13 @@ int IsDotNetImage(PVOID Buffer)
 	PIMAGE_DOS_HEADER pDosHeader;
 	PIMAGE_NT_HEADERS pNtHeader = NULL;
 
+	if (!IsAddressAccessible(Buffer) || IsDisguisedPEHeader(Buffer) <= 0)
+		return 0;
+
+	pDosHeader = (PIMAGE_DOS_HEADER)Buffer;
+
 	__try
 	{
-		pDosHeader = (PIMAGE_DOS_HEADER)Buffer;
-
 		if (pDosHeader->e_lfanew && (ULONG)pDosHeader->e_lfanew < PE_HEADER_LIMIT && ((ULONG)pDosHeader->e_lfanew & 3) == 0)
 			pNtHeader = (PIMAGE_NT_HEADERS)((PUCHAR)pDosHeader + (ULONG)pDosHeader->e_lfanew);
 
@@ -2007,6 +2154,195 @@ DWORD GetTimeStamp(PVOID Address)
 }
 
 //**************************************************************************************
+int VerifyCodeSection(PVOID ImageBase, LPCWSTR Path)
+//**************************************************************************************
+{
+	PIMAGE_DOS_HEADER pDosHeader;
+	PIMAGE_NT_HEADERS pNtHeader = NULL;
+	PIMAGE_BASE_RELOCATION Relocations;
+	ULONG RelocationSize = 0, Size = 0;
+	DWORD_PTR Delta;
+
+	int RetVal = -1;
+
+	if (!ImageBase)
+	{
+		DebugOutput("VerifyCodeSection: Error - no address supplied.\n");
+		return RetVal;
+	}
+
+	if (IsDisguisedPEHeader(ImageBase) <= 0)
+		return RetVal;
+
+	pDosHeader = (PIMAGE_DOS_HEADER)ImageBase;
+
+	if (!IsAddressAccessible(ImageBase))
+	{
+#ifdef DEBUG_COMMENTS
+		DebugOutput("VerifyCodeSection: 0x%p inaccessible\n", ImageBase);
+#endif
+		return RetVal;
+	}
+
+	if (*(WORD*)ImageBase != IMAGE_DOS_SIGNATURE)
+		return RetVal;
+
+	pNtHeader = (PIMAGE_NT_HEADERS)((PBYTE)pDosHeader + pDosHeader->e_lfanew);
+
+	if (!IsAddressAccessible(pNtHeader))
+	{
+#ifdef DEBUG_COMMENTS
+		DebugOutput("VerifyCodeSection: NT headers at 0x%p inaccessible\n", pNtHeader);
+#endif
+		return RetVal;
+	}
+
+	if (*(DWORD*)pNtHeader != IMAGE_NT_SIGNATURE)
+		return RetVal;
+
+	DWORD SizeOfHeaders = pDosHeader->e_lfanew + FIELD_OFFSET(IMAGE_NT_HEADERS, OptionalHeader) + pNtHeader->FileHeader.SizeOfOptionalHeader;
+	PIMAGE_SECTION_HEADER pFirstSectionHeader = (PIMAGE_SECTION_HEADER)((BYTE*)ImageBase + SizeOfHeaders);
+
+    HANDLE hFile = CreateFileW(Path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+
+    if (hFile == INVALID_HANDLE_VALUE)
+	{
+#ifdef DEBUG_COMMENTS
+		DebugOutput("VerifyCodeSection: Error opening file");
+#endif
+		return RetVal;
+    }
+
+    IMAGE_DOS_HEADER DosHeader;
+    DWORD bytesRead;
+    if (!ReadFile(hFile, &DosHeader, sizeof(IMAGE_DOS_HEADER), &bytesRead, NULL))
+	{
+#ifdef DEBUG_COMMENTS
+		DebugOutput("VerifyCodeSection: Error reading file");
+#endif
+		goto end;
+	}
+
+    if (DosHeader.e_magic != IMAGE_DOS_SIGNATURE)
+	{
+#ifdef DEBUG_COMMENTS
+		DebugOutput("VerifyCodeSection: IMAGE_DOS_SIGNATURE");
+#endif
+		goto end;
+	}
+
+	SetFilePointer(hFile, DosHeader.e_lfanew, 0, FILE_BEGIN);
+
+    IMAGE_NT_HEADERS NtHeaders;
+    if (!ReadFile(hFile, &NtHeaders, sizeof(IMAGE_NT_HEADERS), &bytesRead, NULL))
+	{
+#ifdef DEBUG_COMMENTS
+		DebugOutput("VerifyCodeSection: Error reading header");
+#endif
+		goto end;
+	}
+
+	SetFilePointer(hFile, SizeOfHeaders, 0, FILE_BEGIN);
+
+    IMAGE_SECTION_HEADER FirstSectionHeader;
+    if (!ReadFile(hFile, &FirstSectionHeader, sizeof(IMAGE_SECTION_HEADER), &bytesRead, NULL))
+	{
+#ifdef DEBUG_COMMENTS
+		DebugOutput("VerifyCodeSection: Error reading first section");
+#endif
+		goto end;
+	}
+
+    if (NtHeaders.OptionalHeader.SizeOfCode != FirstSectionHeader.SizeOfRawData)
+	{
+		DebugOutput("VerifyCodeSection: SizeOfCode mismatch: 0x%x vs 0x%x", NtHeaders.OptionalHeader.SizeOfCode, FirstSectionHeader.SizeOfRawData);
+		goto end;
+	}
+
+    BYTE* CodeSectionBuffer = (BYTE*)calloc(1, NtHeaders.OptionalHeader.SizeOfCode);
+    if (CodeSectionBuffer == NULL)
+	{
+#ifdef DEBUG_COMMENTS
+		DebugOutput("VerifyCodeSection: Error allocating memory");
+#endif
+		return RetVal;
+    }
+
+	SetFilePointer(hFile, FirstSectionHeader.PointerToRawData, 0, FILE_BEGIN);
+
+    DWORD BytesReadInSection;
+    if (!ReadFile(hFile, CodeSectionBuffer, NtHeaders.OptionalHeader.SizeOfCode, &BytesReadInSection, NULL))
+	{
+#ifdef DEBUG_COMMENTS
+		ErrorOutput("VerifyCodeSection: Error reading code section");
+#endif
+		return RetVal;
+    }
+
+	Relocations = (PIMAGE_BASE_RELOCATION)((PBYTE)ImageBase + NtHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
+	RelocationSize = NtHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
+	Delta = (DWORD_PTR)((PBYTE)ImageBase - NtHeaders.OptionalHeader.ImageBase);
+#ifdef DEBUG_COMMENTS
+	DebugOutput("VerifyCodeSection: Relocations set to 0x%p, size 0x%x, Delta 0x%p, ImageBase 0x%p\n", Relocations, RelocationSize, Delta, NtHeaders.OptionalHeader.ImageBase);
+#endif
+
+	__try
+	{
+		while (RelocationSize > Size && Relocations->SizeOfBlock)
+		{
+			ULONG NumOfRelocs = (Relocations->SizeOfBlock - 8) / 2;
+			PUSHORT Reloc = (PUSHORT)((PUCHAR)Relocations + 8);
+
+#ifdef DEBUG_COMMENTS
+			DebugOutput("VerifyCodeSection: VirtualAddress: 0x%.8x; Number of Relocs: %d; Size: %d\n", Relocations->VirtualAddress, NumOfRelocs, Relocations->SizeOfBlock);
+#endif
+			for (ULONG i = 0; i < NumOfRelocs; i++)
+			{
+				if (Reloc[i] > 0)
+				{
+					PUCHAR *RVA = (PUCHAR*)((PBYTE)(DWORD_PTR)Relocations->VirtualAddress + (Reloc[i] & 0x0FFF));
+					DWORD_PTR Offset = (DWORD_PTR)((PBYTE)RVA - pFirstSectionHeader->VirtualAddress);
+					if (Offset < FirstSectionHeader.SizeOfRawData)
+#ifndef _WIN64
+						(PUCHAR)*((PULONG)((PBYTE)CodeSectionBuffer + Offset)) += (ULONG)((ULONGLONG)Delta);
+#else
+						(PULONGLONG)*((PULONGLONG)(CodeSectionBuffer + Offset)) += (ULONGLONG)Delta;
+#endif
+				}
+			}
+
+			Relocations = (PIMAGE_BASE_RELOCATION)((PUCHAR)Relocations + Relocations->SizeOfBlock);
+			Size += Relocations->SizeOfBlock;
+		}
+	}
+	__except(EXCEPTION_EXECUTE_HANDLER)
+	{
+		DebugOutput("VerifyCodeSection: Exception rebasing image from 0x%p to 0x%p.\n", ImageBase, NtHeaders.OptionalHeader.ImageBase);
+	}
+
+	PVOID pFirstSection = (PVOID)((PBYTE)ImageBase + pFirstSectionHeader->VirtualAddress);
+
+    if (!memcmp((PVOID)CodeSectionBuffer, (PVOID)((PBYTE)ImageBase + pFirstSectionHeader->VirtualAddress), NtHeaders.OptionalHeader.SizeOfCode))
+	{
+#ifdef DEBUG_COMMENTS
+        DebugOutput("VerifyCodeSection: Executable code matches.\n");
+#endif
+		RetVal = 1;
+    }
+	else
+	{
+        DebugOutput("VerifyCodeSection: Executable code does not match.\n");
+		RetVal = 0;
+    }
+
+end:
+    free(CodeSectionBuffer);
+    CloseHandle(hFile);
+
+    return RetVal;
+}
+
+//**************************************************************************************
 BOOL DumpStackRegion(void)
 //**************************************************************************************
 {
@@ -2175,7 +2511,7 @@ BOOL DumpRegion(PVOID Address)
 
 	CapeMetaData->Address = AllocationBase;
 
-	if (!CapeMetaData->DumpType || CapeMetaData->DumpType == UNPACKED_SHELLCODE)
+	if (!(CapeMetaData->TypeString && strlen(CapeMetaData->TypeString)) && (!CapeMetaData->DumpType || CapeMetaData->DumpType == UNPACKED_SHELLCODE))
 		CapeMetaData->DumpType = UNPACKED_PE;
 
 	// If PEs in range but not at AllocationBase dump as shellcode
@@ -2362,16 +2698,8 @@ void DumpInterestingRegions(MEMORY_BASIC_INFORMATION MemInfo)
 	if (MemInfo.BaseAddress == (PVOID)g_our_dll_base)
 		return;
 
-	__try
-	{
-		BYTE Test = *(BYTE*)MemInfo.BaseAddress;
-		Test = *(BYTE*)MemInfo.BaseAddress + PE_HEADER_LIMIT;
-	}
-	__except(EXCEPTION_EXECUTE_HANDLER)
-	{
-		// No point in continuing if we can't read!
+	if (!IsAddressAccessible(MemInfo.BaseAddress))
 		return;
-	}
 
 	char ModulePath[MAX_PATH];
 	BOOL MappedModule = GetMappedFileName(GetCurrentProcess(), MemInfo.AllocationBase, ModulePath, MAX_PATH);
@@ -2385,6 +2713,22 @@ void DumpInterestingRegions(MEMORY_BASIC_INFORMATION MemInfo)
 		CapeMetaData->Address = MemInfo.BaseAddress;
 
 		DumpImageInCurrentProcess(MemInfo.BaseAddress);
+	}
+
+	if (MemInfo.BaseAddress == ClrJIT)
+	{
+		DebugOutput("DumpInterestingRegions: Dumping .NET JIT native cache at 0x%p.\n", MemInfo.BaseAddress);
+
+		CapeMetaData->ModulePath = NULL;
+		CapeMetaData->DumpType = 0;
+#ifdef _WIN64
+		CapeMetaData->TypeString = ".NET JIT native cache (64-bit)";
+#else
+		CapeMetaData->TypeString = ".NET JIT native cache (32-bit)";
+#endif
+		CapeMetaData->Address = MemInfo.BaseAddress;
+
+		DumpRegion(MemInfo.BaseAddress);
 	}
 }
 
@@ -2406,7 +2750,15 @@ int DoProcessDump()
 	if (!SystemInfo.dwPageSize)
 	{
 		ErrorOutput("DoProcessDump: Failed to obtain system page size.\n");
-		goto out;
+		return 0;
+	}
+
+	if (ProcessDumped)
+	{
+#ifdef DEBUG_COMMENTS
+		DebugOutput("DoProcessDump: This process has already been dumped.\n");
+#endif
+		return 0;
 	}
 
 	if (g_config.procdump)
@@ -2422,25 +2774,33 @@ int DoProcessDump()
 
 		if (IsAddressAccessible(ImageBase))
 		{
-			DebugOutput("DoProcessDump: Dumping Imagebase at 0x%p.\n", ImageBase);
+			if (!VerifyCodeSection(ImageBase, our_process_path_w))
+			{
+				DebugOutput("DoProcessDump: Code modification detected, dumping Imagebase at 0x%p.\n", ImageBase);
 
-			CapeMetaData->DumpType = PROCDUMP;
-			__try
-			{
-				if (g_config.import_reconstruction)
-					ProcessDumped = DumpImageInCurrentProcessFixImports(ImageBase, 0);
-				else
-					ProcessDumped = DumpImageInCurrentProcess(ImageBase);
+				CapeMetaData->DumpType = PROCDUMP;
+				__try
+				{
+					if (g_config.import_reconstruction)
+						ProcessDumped = DumpImageInCurrentProcessFixImports(ImageBase, 0);
+					else
+						ProcessDumped = DumpImageInCurrentProcess(ImageBase);
+				}
+				__except(EXCEPTION_EXECUTE_HANDLER)
+				{
+					DebugOutput("DoProcessDump: Failed to dump main process image at 0x%p.\n", ImageBase);
+					goto out;
+				}
 			}
-			__except(EXCEPTION_EXECUTE_HANDLER)
+			else
 			{
-				DebugOutput("DoProcessDump: Failed to dump main process image at 0x%p.\n", ImageBase);
-				goto out;
+				DebugOutput("DoProcessDump: Skipping process dump as code is identical on disk.\n");
+				ProcessDumped = TRUE;
 			}
 		}
 #ifdef DEBUG_COMMENTS
 		else
-			DebugOutput("DoProcessDump: VirtualQuery failed for Imagebase at 0x%p.\n", ImageBase);
+			DebugOutput("DoProcessDump: Imagebase at 0x%p inaccessible.\n", ImageBase);
 #endif
 		if (NewImageBase && IsAddressAccessible(NewImageBase))
 		{
@@ -2462,7 +2822,7 @@ int DoProcessDump()
 		}
 #ifdef DEBUG_COMMENTS
 		else if (NewImageBase)
-			DebugOutput("DoProcessDump: VirtualQuery failed for Imagebase at 0x%p.\n", NewImageBase);
+			DebugOutput("DoProcessDump: Imagebase at 0x%p inaccessible.\n", NewImageBase);
 #endif
 
 		if (!ProcessDumped)
@@ -2496,6 +2856,10 @@ int DoProcessDump()
 			DebugOutput("DoProcessDump: Unable to create dump file for full process memory dump.\n");
 			goto out;
 		}
+#ifdef DEBUG_COMMENTS
+		else
+			DebugOutput("DoProcessDump: Saving full process memory dump to %s.\n", FullDumpPath);
+#endif
 	}
 
 	if (!g_config.procdump && !g_config.procmemdump)
@@ -2519,7 +2883,7 @@ int DoProcessDump()
 		if (g_config.procdump && MemInfo.BaseAddress != ImageBase && MemInfo.BaseAddress != NewImageBase && !is_in_dll_range((ULONG_PTR)Address))
 			DumpInterestingRegions(MemInfo);
 
-		if (g_config.procmemdump && !is_in_dll_range((ULONG_PTR)Address))
+		if (g_config.procmemdump && !is_in_dll_range((ULONG_PTR)Address) && IsAddressAccessible((PVOID)Address) && !ScanForRulesCanary(MemInfo.BaseAddress, MemInfo.RegionSize))
 		{
 			LARGE_INTEGER BufferAddress;
 			DWORD BytesWritten;
@@ -2547,8 +2911,8 @@ int DoProcessDump()
 #ifdef DEBUG_COMMENTS
 				if (BytesWritten != MemInfo.RegionSize)
 					DebugOutput("DoProcessDump: Anomaly detected, wrote only 0x%x of 0x%x bytes to memory dump from region 0x%p.\n", BytesWritten, MemInfo.RegionSize, MemInfo.BaseAddress);
-				else
-					DebugOutput("DoProcessDump: Added 0x%x byte region at 0x%p to memory dump (protect 0x%x).\n", MemInfo.RegionSize, MemInfo.BaseAddress, MemInfo.Protect);
+				//else
+				//	DebugOutput("DoProcessDump: Added 0x%x byte region at 0x%p to memory dump (protect 0x%x).\n", MemInfo.RegionSize, MemInfo.BaseAddress, MemInfo.Protect);
 #endif
 			}
 			__except(EXCEPTION_EXECUTE_HANDLER)
@@ -2573,6 +2937,8 @@ out:
 				DoOutputFile(FullDumpPath);
 			DebugOutput("DoProcessDump: Full process memory dump saved to file: %s.\n", FullDumpPath);
 		}
+		else
+			DebugOutput("DoProcessDump: There was a problem saving full process memory dump to: %s.\n", FullDumpPath);
 		if (OutputFilename)
 			free(OutputFilename);
 		if (FullDumpPath)
@@ -2645,17 +3011,6 @@ void CAPE_post_init()
 		DebugOutput("Post-init: Failed to initialise debugger.\n");
 #endif
 
-	if (!g_config.debugger && g_config.upx)
-	{
-		CapeMetaData->DumpType = UPX;
-		g_config.procdump = 0;
-		if (InitialiseDebugger())
-			DebugOutput("UPX unpacker: Debugger initialised.\n");
-		else
-			DebugOutput("UPX unpacker: Failed to initialise debugger.\n");
-		UPXInitialBreakpoints(GetModuleHandle(NULL));
-	}
-
 	if (g_config.unpacker)
 		UnpackerInit();
 
@@ -2697,15 +3052,53 @@ void CAPE_init()
 	// Cuckoo debug output level for development (0=none, 2=max)
 	// g_config.debug = 2;
 
-	if (base_of_dll_of_interest)
-		ImageBase = (PVOID)base_of_dll_of_interest;
-	else
-		ImageBase = GetModuleHandle(NULL);
+	YaraInit();
+
+	ImageBase = GetModuleHandle(NULL);
 
 	if (g_config.yarascan)
+		YaraScan(ImageBase, GetAccessibleSize(ImageBase));
+
+	if (g_config.yarascan && is_image_base_remapped(ImageBase))
 	{
-		DebugOutput("Initialising Yara...\n");
-		YaraInit();
+		ImageBaseRemapped = TRUE;
+
+		HANDLE FileHandle = CreateFileW(our_process_path_w, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+		if (FileHandle == INVALID_HANDLE_VALUE)
+		{
+			ErrorOutput("CAPE_init: Unable to open main executable image");
+			goto Finish;
+		}
+
+		DWORD FileSize = GetFileSize(FileHandle, NULL);
+		if (FileSize == INVALID_FILE_SIZE)
+		{
+			ErrorOutput("CAPE_init: Unable to get size of main executable image");
+			goto Finish;
+		}
+
+		HANDLE MappingHandle = CreateFileMapping(FileHandle, NULL, PAGE_READONLY, 0, 0, NULL);
+		if (MappingHandle == NULL)
+		{
+			ErrorOutput("CAPE_init: Unable to create file mapping of main executable image");
+			goto Finish;
+		}
+
+		LPVOID Mapped = MapViewOfFile(MappingHandle, FILE_MAP_READ, 0, 0, FileSize);
+		if (Mapped == NULL)
+		{
+			ErrorOutput("CAPE_init: Unable to map main executable image");
+			goto Finish;
+		}
+
+		DebugOutput("CAPE_init: Main executable image temporarily remapped for scanning at 0x%p", Mapped);
+
+		YaraScan(Mapped, GetAccessibleSize(ImageBase));
+
+Finish:
+		if (Mapped) UnmapViewOfFile(Mapped);
+		if (MappingHandle) CloseHandle(MappingHandle);
+		if (FileHandle && FileHandle != INVALID_HANDLE_VALUE) CloseHandle(FileHandle);
 	}
 
 	OSVersion.dwOSVersionInfoSize = sizeof(OSVERSIONINFO);

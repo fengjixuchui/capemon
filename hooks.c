@@ -22,9 +22,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "hook_sleep.h"
 #include "pipe.h"
 
-extern char *our_process_name;
-extern int path_is_system(const wchar_t *path_w);
-extern int path_is_program_files(const wchar_t *path_w);
 extern VOID CALLBACK New_DllLoadNotification(ULONG NotificationReason, const PLDR_DLL_NOTIFICATION_DATA NotificationData, PVOID Context);
 extern void DebugOutput(_In_ LPCTSTR lpOutputString, ...);
 extern void ErrorOutput(_In_ LPCTSTR lpOutputString, ...);
@@ -76,6 +73,7 @@ hook_t full_hooks[] = {
 	HOOK_NOTAIL(ntdll, LdrUnloadDll, 1),
 	HOOK_SPECIAL(ntdll, NtCreateUserProcess),
 	HOOK_SPECIAL(kernel32, CreateProcessInternalW),
+	HOOK_SPECIAL(clrjit, compileMethod),
 	HOOK_SPECIAL(urlmon, IsValidURL),
 	//HOOK(kernel32, lstrcpynA),
 	//HOOK(kernel32, lstrcmpiA),
@@ -97,6 +95,8 @@ hook_t full_hooks[] = {
 	HOOK_NOTAIL_ALT(kernel32, MoveFileWithProgressW, 5),
 	HOOK_NOTAIL_ALT(kernelbase, MoveFileWithProgressTransactedW, 6),
 	HOOK_NOTAIL_ALT(kernel32, MoveFileWithProgressTransactedW, 6),
+	HOOK(kernel32, UpdateProcThreadAttribute),
+	HOOK(kernel32, GetWriteWatch),
 
 	// File Hooks
 	HOOK(ntdll, NtQueryAttributesFile),
@@ -181,6 +181,8 @@ hook_t full_hooks[] = {
 	HOOK(kernel32, RegCreateKeyExW),
 	HOOK(kernel32, RegDeleteKeyA),
 	HOOK(kernel32, RegDeleteKeyW),
+	HOOK(advapi32, RegDeleteKeyExW),
+	HOOK(advapi32, RegDeleteKeyExA),
 	HOOK(kernel32, RegEnumKeyW),
 	HOOK(kernel32, RegEnumKeyExA),
 	HOOK(kernel32, RegEnumKeyExW),
@@ -223,6 +225,8 @@ hook_t full_hooks[] = {
 	HOOK(user32, FindWindowExW),
 	HOOK(user32, PostMessageA),
 	HOOK(user32, PostMessageW),
+	HOOK(user32, PostThreadMessageA),
+	HOOK(user32, PostThreadMessageW),
 //	HOOK(user32, SendMessageA),	// maldoc detonation issues
 //	HOOK(user32, SendMessageW),	//
 	HOOK(user32, SendNotifyMessageA),
@@ -279,6 +283,8 @@ hook_t full_hooks[] = {
 	HOOK(ntdll, NtMapViewOfSectionEx),
 	HOOK(ntdll, NtUnmapViewOfSection),
 	HOOK(ntdll, NtUnmapViewOfSectionEx),
+	HOOK(ntdll, NtOpenProcessToken),
+	HOOK(ntdll, NtQueryInformationToken),
 	HOOK(kernel32, WaitForDebugEvent),
 	HOOK(ntdll, DbgUiWaitStateChange),
 	HOOK(advapi32, CreateProcessWithLogonW),
@@ -288,6 +294,10 @@ hook_t full_hooks[] = {
 	HOOK(kernel32, Process32NextW),
 	HOOK(kernel32, Module32FirstW),
 	HOOK(kernel32, Module32NextW),
+	HOOK(kernel32, CreateProcessA),
+	HOOK(kernel32, CreateProcessW),
+	HOOK(kernel32, WinExec),
+	HOOK(kernel32, LoadLibraryExW),
 	//HOOK(kernel32, VirtualFreeEx),
 	// all variants of ShellExecute end up in ShellExecuteExW
 	HOOK(shell32, ShellExecuteExW),
@@ -301,6 +311,7 @@ hook_t full_hooks[] = {
 	HOOK(ntdll, NtQueueApcThreadEx),
 	HOOK(ntdll, NtOpenThread),
 	HOOK(ntdll, NtGetContextThread),
+	HOOK(ntdll, RtlWow64GetThreadContext),
 	HOOK(ntdll, NtSetContextThread),
 	HOOK(ntdll, NtSuspendThread),
 	HOOK(ntdll, NtResumeThread),
@@ -354,6 +365,7 @@ hook_t full_hooks[] = {
 	HOOK(user32, GetCursorPos),
 	HOOK(kernel32, GetComputerNameA),
 	HOOK(kernel32, GetComputerNameW),
+	HOOK(kernel32, GetComputerNameExW),
 	HOOK(advapi32, GetUserNameA),
 	HOOK(advapi32, GetUserNameW),
 	HOOK(user32, GetAsyncKeyState),
@@ -615,6 +627,7 @@ hook_t min_hooks[] = {
 	HOOK_SPECIAL(ntdll, NtCreateUserProcess),
 	HOOK_SPECIAL(kernel32, CreateProcessInternalW),
 
+	HOOK_SPECIAL(clrjit, compileMethod),
 	HOOK_SPECIAL(ole32, CoCreateInstance),
 	HOOK_SPECIAL(ole32, CoCreateInstanceEx),
 	HOOK_SPECIAL(ole32, CoGetClassObject),
@@ -864,6 +877,8 @@ hook_t office_hooks[] = {
 	HOOK(user32, FindWindowExW),
 	HOOK(user32, PostMessageA),
 	HOOK(user32, PostMessageW),
+	HOOK(user32, PostThreadMessageA),
+	HOOK(user32, PostThreadMessageW),
 //	HOOK(user32, SendMessageA),	// maldoc detonation issues
 //	HOOK(user32, SendMessageW),	//
 	HOOK(user32, SendNotifyMessageA),
@@ -926,6 +941,9 @@ hook_t office_hooks[] = {
 	HOOK(kernel32, Process32NextW),
 	HOOK(kernel32, Module32FirstW),
 	HOOK(kernel32, Module32NextW),
+	HOOK(kernel32, CreateProcessA),
+	HOOK(kernel32, CreateProcessW),
+	HOOK(kernel32, WinExec),
 	//HOOK(kernel32, VirtualFreeEx),
 	// all variants of ShellExecute end up in ShellExecuteExW
 	HOOK(shell32, ShellExecuteExW),
@@ -989,6 +1007,7 @@ hook_t office_hooks[] = {
 	HOOK(user32, GetCursorPos),
 	HOOK(kernel32, GetComputerNameA),
 	HOOK(kernel32, GetComputerNameW),
+	HOOK(kernel32, GetComputerNameExW),
 	HOOK(advapi32, GetUserNameA),
 	HOOK(advapi32, GetUserNameW),
 	HOOK(user32, GetAsyncKeyState),
@@ -1393,145 +1412,6 @@ void set_hooks()
 
 	IsWow64Process(GetCurrentProcess(), &Wow64Process);
 
-	if (path_is_program_files(our_process_path_w))
-	{
-#ifndef _WIN64
-		if (!_stricmp(our_process_name, "firefox.exe"))
-        {
-            g_config.firefox = 1;
-            g_config.injection = 0;
-			g_config.unpacker = 0;
-            g_config.caller_regions = 0;
-            g_config.api_rate_cap = 0;
-            g_config.yarascan = 0;
-            g_config.ntdll_protect = 0;
-            DebugOutput("Firefox-specific hook-set enabled.\n");
-        }
-		else
-#endif
-		if (!_stricmp(our_process_name, "iexplore.exe"))
-        {
-            g_config.iexplore = 1;
-            g_config.injection = 0;
-            g_config.api_rate_cap = 0;
-            g_config.ntdll_protect = 0;
-            g_config.yarascan = 0;
-            DebugOutput("Internet Explorer-specific hook-set enabled.\n");
-        }
-
-		if (strstr(our_process_path, "Microsoft Office"))
-        {
-			g_config.office = 1;
-			g_config.unpacker = 0;
-			g_config.caller_regions = 0;
-			g_config.injection = 0;
-			g_config.yarascan = 0;
-			g_config.ntdll_protect = 0;
-			DebugOutput("Microsoft Office settings enabled.\n");
-        }
-	}
-	else if (path_is_system(our_process_path_w))
-	{
-		if (!_stricmp(our_process_name, "msiexec.exe")) {
-			const char *excluded_apis[] = {
-				"NtAllocateVirtualMemory",
-				"NtProtectVirtualMemory",
-				"VirtualProtectEx",
-				"CryptDecodeMessage",
-				"CryptDecryptMessage",
-				"NtCreateThreadEx",
-				"SetWindowLongPtrA",
-				"SetWindowLongPtrW",
-				"NtWaitForSingleObject",
-				"NtSetTimer",
-				"NtSetTimerEx",
-				"RegOpenKeyExA",
-				"RegOpenKeyExW",
-				"RegCreateKeyExA",
-				"RegCreateKeyExW",
-				"RegDeleteKeyA",
-				"RegDeleteKeyW",
-				"RegEnumKeyW",
-				"RegEnumKeyExA",
-				"RegEnumKeyExW",
-				"RegEnumValueA",
-				"RegEnumValueW",
-				"RegSetValueExA",
-				"RegSetValueExW",
-				"RegQueryValueExA",
-				"RegQueryValueExW",
-				"RegDeleteValueA",
-				"RegDeleteValueW",
-				"RegQueryInfoKeyA",
-				"RegQueryInfoKeyW",
-				"RegCloseKey",
-				"RegNotifyChangeKeyValue",
-				"NtCreateKey",
-				"NtOpenKey",
-				"NtOpenKeyEx",
-				"NtRenameKey",
-				"NtReplaceKey",
-				"NtEnumerateKey",
-				"NtEnumerateValueKey",
-				"NtSetValueKey",
-				"NtQueryValueKey",
-				"NtQueryMultipleValueKey",
-				"NtDeleteKey",
-				"NtDeleteValueKey",
-				"NtLoadKey",
-				"NtLoadKey2",
-				"NtLoadKeyEx",
-				"NtQueryKey",
-				"NtSaveKey",
-				"NtSaveKeyEx"
-			};
-
-			for (unsigned int i = 0; i < sizeof(excluded_apis) / sizeof(excluded_apis[0]); i++) {
-				if (!add_hook_exclusion(excluded_apis[i])) {
-					DebugOutput("Unable to set hook exclusion for msiexec.\n");
-					break;
-				}
-			}
-			g_config.ntdll_protect = 0;
-			g_config.yarascan = 0;
-			g_config.msi = 1;
-			DebugOutput("MsiExec hook set enabled\n");
-		}
-		else if (!_stricmp(our_process_name, "services.exe")) {
-			g_config.yarascan = 0;
-			g_config.unpacker = 0;
-			g_config.caller_regions = 0;
-			g_config.injection = 0;
-			g_config.minhook = 1;
-			disable_sleep_skip();
-			DebugOutput("services.exe hook set enabled\n");
-		}
-		else if (!_stricmp(our_process_name, "svchost.exe") && wcsstr(our_commandline, L"-k DcomLaunch") || wcsstr(our_commandline, L"-k netsvcs")) {
-			g_config.yarascan = 0;
-			g_config.unpacker = 0;
-			g_config.caller_regions = 0;
-			g_config.injection = 0;
-			g_config.minhook = 1;
-			disable_sleep_skip();
-			DebugOutput("Service host hook set enabled\n");
-		}
-		else if (!_stricmp(our_process_name, "wscript.exe")) {
-			const char *excluded_apis[] = {
-				"memcpy",
-				"LoadResource",
-				"LockResource",
-				"SizeofResource",
-			};
-			for (unsigned int i = 0; i < sizeof(excluded_apis) / sizeof(excluded_apis[0]); i++) {
-				if (!add_hook_exclusion(excluded_apis[i])) {
-					DebugOutput("Unable to set hook exclusion for wscript\n");
-					break;
-				}
-			}
-			DebugOutput("wscript hook set enabled\n");
-		}
-	}
-
 	// Hook set selection
 	if (TestHooks) {
 		DebugOutput("Test hook set enabled");
@@ -1580,8 +1460,6 @@ void set_hooks()
 
 	memset(&threadInfo, 0, sizeof(threadInfo));
 	threadInfo.dwSize = sizeof(threadInfo);
-
-	hook_init();
 
 	hook_disable();
 

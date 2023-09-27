@@ -248,6 +248,28 @@ HOOKDEF(LONG, WINAPI, RegDeleteKeyW,
 	return ret;
 }
 
+HOOKDEF(LSTATUS, WINAPI, RegDeleteKeyExW,
+	_In_ HKEY    hKey,
+	_In_ LPCWSTR lpSubKey,
+	_In_ REGSAM  samDesired,
+	__reserved DWORD   Reserved
+) {
+	LSTATUS ret = Old_RegDeleteKeyExW(hKey, lpSubKey, samDesired, Reserved);
+	LOQ_zero("registry", "puhE", "Handle", hKey, "SubKey", lpSubKey, "Access", samDesired, "FullName", hKey, lpSubKey);
+	return ret;
+}
+
+HOOKDEF(LSTATUS, WINAPI, RegDeleteKeyExA,
+	_In_ HKEY   hKey,
+	_In_ LPCSTR lpSubKey,
+	_In_ REGSAM samDesired,
+	__reserved DWORD  Reserved
+) {
+	LSTATUS ret = Old_RegDeleteKeyExA(hKey, lpSubKey, samDesired, Reserved);
+	LOQ_zero("registry", "puhE", "Handle", hKey, "SubKey", lpSubKey, "Access", samDesired, "FullName", hKey, lpSubKey);
+	return ret;
+}
+
 HOOKDEF(LONG, WINAPI, RegEnumKeyW,
 	__in   HKEY hKey,
 	__in   DWORD dwIndex,
@@ -278,7 +300,7 @@ HOOKDEF(LONG, WINAPI, RegEnumKeyW,
 
 		for (i = 0, j = 0; i < _countof(parent_keys); i += 1, j += 2) {
 			if (!wcsicmp(keypath, parent_keys[i]) && !wcsicmp(lpName, replace_subkeys[j])) {
-				wcscpy(lpName, replace_subkeys[j + 1]);
+				wcscpy_s(lpName, sizeof(lpName), replace_subkeys[j + 1]);
 				break;
 			}
 		}
@@ -326,7 +348,7 @@ HOOKDEF(LONG, WINAPI, RegEnumKeyExA,
 
 		for (i = 0, j = 0; i < _countof(parent_keys); i += 1, j += 2) {
 			if (!wcsicmp(keypath, parent_keys[i]) && !stricmp(lpName, replace_subkeys[j])) {
-				strcpy(lpName, replace_subkeys[j + 1]);
+				strcpy_s(lpName, sizeof(lpName), replace_subkeys[j + 1]);
 				break;
 			}
 		}
@@ -376,7 +398,7 @@ HOOKDEF(LONG, WINAPI, RegEnumKeyExW,
 
 		for (i = 0, j = 0; i < _countof(parent_keys); i += 1, j += 2) {
 			if (!wcsicmp(keypath, parent_keys[i]) && !wcsicmp(lpName, replace_subkeys[j])) {
-				wcscpy(lpName, replace_subkeys[j + 1]);
+				wcscpy_s(lpName, sizeof(lpName), replace_subkeys[j + 1]);
 				break;
 			}
 		}

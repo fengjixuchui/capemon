@@ -47,28 +47,29 @@ extern LONG WINAPI capemon_exception_handler(__in struct _EXCEPTION_POINTERS *Ex
 extern BOOL UnpackerGuardPageHandler(struct _EXCEPTION_POINTERS* ExceptionInfo);
 extern PTRACKEDREGION GetTrackedRegion(PVOID Address);
 extern PVOID GetPageAddress(PVOID Address);
+extern PCHAR GetNameBySsn(unsigned int Number);
 extern unsigned int address_is_in_stack(DWORD Address);
 extern BOOL WoW64fix(void);
 extern BOOL WoW64PatchBreakpoint(unsigned int Register);
 extern BOOL WoW64UnpatchBreakpoint(unsigned int Register);
 extern void DebugOutput(_In_ LPCTSTR lpOutputString, ...);
 extern void ErrorOutput(_In_ LPCTSTR lpOutputString, ...);
-extern BOOL SetInitialBreakpoints(PVOID ImageBase);
+extern BOOL SetInitialBreakpoints(PVOID ImageBase), Trace(struct _EXCEPTION_POINTERS* ExceptionInfo), SoftwareBreakpointCallback(struct _EXCEPTION_POINTERS* ExceptionInfo);
 extern int operate_on_backtrace(ULONG_PTR _esp, ULONG_PTR _ebp, void *extra, int(*func)(void *, ULONG_PTR));
-extern void DebuggerOutput(_In_ LPCTSTR lpOutputString, ...);
+extern void DebuggerOutput(_In_ LPCTSTR lpOutputString, ...), DoTraceOutput(PVOID Address);
 extern BOOL TraceRunning, BreakpointsSet, BreakpointsHit, StopTrace, BreakOnNtContinue;
 extern PVOID BreakOnNtContinueCallback;
 extern int StepOverRegister;
 extern int process_shutting_down;
 extern HANDLE DebuggerLog;
 
-DWORD MainThreadId;
 struct ThreadBreakpoints *MainThreadBreakpointList;
 GUARD_PAGE_HANDLER GuardPageHandler;
 unsigned int TrapIndex, DepthCount;
 PVOID _KiUserExceptionDispatcher;
 HANDLE hCapePipe;
 BOOL SetSingleStepMode(PCONTEXT Context, PVOID Handler), ClearSingleStepMode(PCONTEXT Context);
+static lookup_t SoftBPs, SyscallBPs;
 
 void ApplyQueuedBreakpoints();
 
@@ -76,15 +77,11 @@ void ApplyQueuedBreakpoints();
 PTHREADBREAKPOINTS GetThreadBreakpoints(DWORD ThreadId)
 //**************************************************************************************
 {
-	DWORD CurrentThreadId;
-
 	PTHREADBREAKPOINTS CurrentThreadBreakpoints = MainThreadBreakpointList;
 
 	while (CurrentThreadBreakpoints)
 	{
-		CurrentThreadId = GetThreadId(CurrentThreadBreakpoints->ThreadHandle);
-
-		if (CurrentThreadId == ThreadId)
+		if (CurrentThreadBreakpoints->ThreadId == ThreadId)
 			return CurrentThreadBreakpoints;
 		else
 			CurrentThreadBreakpoints = CurrentThreadBreakpoints->NextThreadBreakpoints;
@@ -133,46 +130,45 @@ PTHREADBREAKPOINTS CreateThreadBreakpoints(DWORD ThreadId, HANDLE Handle)
 			return NULL;
 		}
 
-		memset(MainThreadBreakpointList, 0, sizeof(struct ThreadBreakpoints));
+		CurrentThreadBreakpoints = MainThreadBreakpointList;
 
-		MainThreadBreakpointList->ThreadId = MainThreadId;
+		memset(CurrentThreadBreakpoints, 0, sizeof(struct ThreadBreakpoints));
 	}
-
-	CurrentThreadBreakpoints = MainThreadBreakpointList;
-
-	while (CurrentThreadBreakpoints)
+	else
 	{
-		if (CurrentThreadBreakpoints->ThreadHandle && GetThreadId(CurrentThreadBreakpoints->ThreadHandle) == ThreadId)
+		CurrentThreadBreakpoints = MainThreadBreakpointList;
+
+		while (CurrentThreadBreakpoints)
 		{
+			if (CurrentThreadBreakpoints->ThreadId && CurrentThreadBreakpoints->ThreadId == ThreadId)
+			{
 #ifdef DEBUG_COMMENTS
-			DebugOutput("CreateThreadBreakpoints error: found an existing thread breakpoint list for ThreadId 0x%x\n", ThreadId);
+				DebugOutput("CreateThreadBreakpoints error: found an existing thread breakpoint list for ThreadId %d\n", ThreadId);
 #endif
-			return NULL;
+				return NULL;
+			}
+
+			PreviousThreadBreakpoint = CurrentThreadBreakpoints;
+			CurrentThreadBreakpoints = CurrentThreadBreakpoints->NextThreadBreakpoints;
 		}
 
-		if ((CurrentThreadBreakpoints->ThreadId) == ThreadId)
-			break;
-
-		PreviousThreadBreakpoint = CurrentThreadBreakpoints;
-		CurrentThreadBreakpoints = CurrentThreadBreakpoints->NextThreadBreakpoints;
-	}
-
-	if (!CurrentThreadBreakpoints && PreviousThreadBreakpoint)
-	{
-		// We haven't found it in the linked list, so create a new one
-		CurrentThreadBreakpoints = PreviousThreadBreakpoint;
-
-		CurrentThreadBreakpoints->NextThreadBreakpoints = ((struct ThreadBreakpoints*)malloc(sizeof(struct ThreadBreakpoints)));
-
-		if (CurrentThreadBreakpoints->NextThreadBreakpoints == NULL)
+		if (!CurrentThreadBreakpoints && PreviousThreadBreakpoint)
 		{
-			DebugOutput("CreateThreadBreakpoints: Failed to allocate new thread breakpoints.\n");
-			return NULL;
+			// We haven't found it in the linked list, so create a new one
+			CurrentThreadBreakpoints = PreviousThreadBreakpoint;
+
+			CurrentThreadBreakpoints->NextThreadBreakpoints = ((struct ThreadBreakpoints*)malloc(sizeof(struct ThreadBreakpoints)));
+
+			if (CurrentThreadBreakpoints->NextThreadBreakpoints == NULL)
+			{
+				DebugOutput("CreateThreadBreakpoints: Failed to allocate new thread breakpoints.\n");
+				return NULL;
+			}
+
+			memset(CurrentThreadBreakpoints->NextThreadBreakpoints, 0, sizeof(struct ThreadBreakpoints));
+
+			CurrentThreadBreakpoints = CurrentThreadBreakpoints->NextThreadBreakpoints;
 		}
-
-		memset(CurrentThreadBreakpoints->NextThreadBreakpoints, 0, sizeof(struct ThreadBreakpoints));
-
-		CurrentThreadBreakpoints = CurrentThreadBreakpoints->NextThreadBreakpoints;
 	}
 
 	if (!CurrentThreadBreakpoints)
@@ -219,9 +215,25 @@ BOOL InitNewThreadBreakpoints(DWORD ThreadId, HANDLE Handle)
 	PTHREADBREAKPOINTS NewThreadBreakpoints = NULL;
 	BOOL ThreadBreakpointsSet = FALSE;
 
+	if (!DebuggerInitialised)
+	{
+#ifdef DEBUG_COMMENTS
+		DebugOutput("InitNewThreadBreakpoints: Debugger not initialised - ignoring thread %d.\n", ThreadId);
+#endif
+		return FALSE;
+	}
+
 	if (MainThreadBreakpointList == NULL)
 	{
 		DebugOutput("InitNewThreadBreakpoints: Failed to create thread breakpoints struct.\n");
+		return FALSE;
+	}
+
+	if (GetThreadBreakpoints(ThreadId))
+	{
+#ifdef DEBUG_COMMENTS
+		DebugOutput("InitNewThreadBreakpoints: Thread breakpoints already exists for thread %d.\n", ThreadId);
+#endif
 		return FALSE;
 	}
 
@@ -395,6 +407,89 @@ void ShowStack(DWORD_PTR StackPointer, unsigned int NumberOfRecords)
 }
 
 //**************************************************************************************
+BOOL RestoreSoftwareBreakpoint(struct _EXCEPTION_POINTERS* ExceptionInfo)
+//**************************************************************************************
+{
+#ifdef DEBUG_COMMENTS
+	DebugOutput("RestoreSoftwareBreakpoint: Restoring software breakpoint at 0x%p", ExceptionInfo->ExceptionRecord->ExceptionAddress);
+#endif
+	return SetSoftwareBreakpoint(ExceptionInfo->ExceptionRecord->ExceptionAddress);
+}
+
+//**************************************************************************************
+BOOL SoftwareBreakpointHandler(struct _EXCEPTION_POINTERS* ExceptionInfo)
+//**************************************************************************************
+{
+	DWORD OldProtect;
+	PVOID Address = ExceptionInfo->ExceptionRecord->ExceptionAddress;
+
+	if (!Address)
+		return FALSE;
+
+	BYTE InsByte = *(PBYTE)Address;
+	if (InsByte != 0xCC)
+		return FALSE;
+
+	PBYTE pInsByte = lookup_get(&SoftBPs, (ULONG_PTR)Address, 0);
+
+	if (!pInsByte)
+	{
+		DebugOutput("SoftwareBreakpointHandler: Unable to retrieve instruction byte for 0x%p", Address);
+		return FALSE;
+	}
+
+#ifdef DEBUG_COMMENTS
+	DebugOutput("SoftwareBreakpointHandler: Instruction byte at 0x%p: 0x%x", Address, *pInsByte);
+#endif
+	if (!VirtualProtect(Address, 1, PAGE_EXECUTE_READWRITE, &OldProtect))
+	{
+		DebugOutput("SoftwareBreakpointHandler: Unable to change memory protection at 0x%p", Address);
+		return FALSE;
+	}
+
+	*(PBYTE)Address = *pInsByte;
+
+	VirtualProtect(Address, 1, OldProtect, &OldProtect);
+
+	SoftwareBreakpointCallback(ExceptionInfo);
+
+	return TRUE;
+}
+
+//**************************************************************************************
+BOOL SyscallBreakpointHandler(struct _EXCEPTION_POINTERS* ExceptionInfo)
+//**************************************************************************************
+{
+#ifdef _WIN64
+	unsigned int SSN = (unsigned int)(DWORD_PTR)ExceptionInfo->ContextRecord->Rax;
+#else
+	unsigned int SSN = (unsigned int)(DWORD_PTR)ExceptionInfo->ContextRecord->Eax;
+#endif
+
+	PVOID Function = GetProcAddress(GetModuleHandle("ntdll"), GetNameBySsn(SSN));
+
+	if (!Function)
+	{
+#ifdef DEBUG_COMMENTS
+		DebugOutput("SyscallBreakpointHandler: Unable to find function for SSN 0x%x\n", SSN);
+#endif
+		return FALSE;
+	}
+#ifdef DEBUG_COMMENTS
+	else
+		DebugOutput("SyscallBreakpointHandler: Calling %s at 0x%p\n", GetNameBySsn(SSN), Function);
+#endif
+
+#ifdef _WIN64
+	ExceptionInfo->ContextRecord->Rip = (DWORD_PTR)Function;
+#else
+	ExceptionInfo->ContextRecord->Eip = (DWORD_PTR)Function;
+#endif
+
+	return TRUE;
+}
+
+//**************************************************************************************
 BOOL CAPEExceptionDispatcher(PEXCEPTION_RECORD ExceptionRecord, PCONTEXT Context)
 //**************************************************************************************
 {
@@ -409,7 +504,7 @@ LONG WINAPI CAPEExceptionFilter(struct _EXCEPTION_POINTERS* ExceptionInfo)
 //**************************************************************************************
 {
 	unsigned int bp;
-	BREAKPOINT_HANDLER Handler;
+	DWORD CurrentThreadId = GetCurrentThreadId();
 
 	// Hardware breakpoints generate EXCEPTION_SINGLE_STEP rather than EXCEPTION_BREAKPOINT
 	if (g_config.debugger && ExceptionInfo->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP)
@@ -417,11 +512,11 @@ LONG WINAPI CAPEExceptionFilter(struct _EXCEPTION_POINTERS* ExceptionInfo)
 		PBREAKPOINTINFO pBreakpointInfo;
 		PTHREADBREAKPOINTS CurrentThreadBreakpoints;
 
-		CurrentThreadBreakpoints = GetThreadBreakpoints(GetCurrentThreadId());
+		CurrentThreadBreakpoints = GetThreadBreakpoints(CurrentThreadId);
 
 		if (CurrentThreadBreakpoints == NULL)
 		{
-			DebugOutput("CAPEExceptionFilter: Can't find breakpoints for thread %d\n", GetCurrentThreadId());
+			DebugOutput("CAPEExceptionFilter: Can't find breakpoints for thread %d\n", CurrentThreadId);
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 
@@ -436,8 +531,12 @@ LONG WINAPI CAPEExceptionFilter(struct _EXCEPTION_POINTERS* ExceptionInfo)
 			if (SingleStepHandler)
 				SingleStepHandler(ExceptionInfo);
 			else
+			{
 				// Unhandled single-step exception, pass it on
+				if (BreakpointsSet)
+					ContextClearDebugRegisters(ExceptionInfo->ContextRecord);
 				return EXCEPTION_CONTINUE_SEARCH;
+			}
 
 			return EXCEPTION_CONTINUE_EXECUTION;
 		}
@@ -448,13 +547,13 @@ LONG WINAPI CAPEExceptionFilter(struct _EXCEPTION_POINTERS* ExceptionInfo)
 #ifndef DEBUG_COMMENTS
 		if (!TraceRunning && !g_config.no_logs)
 #endif
-			DebugOutput("CAPEExceptionFilter: breakpoint %d hit by instruction at 0x%p (thread %d)\n", bp, ExceptionInfo->ExceptionRecord->ExceptionAddress, GetCurrentThreadId());
+			DebugOutput("CAPEExceptionFilter: breakpoint %d hit by instruction at 0x%p (thread %d)\n", bp, ExceptionInfo->ExceptionRecord->ExceptionAddress, CurrentThreadId);
 
 		pBreakpointInfo = &(CurrentThreadBreakpoints->BreakpointInfo[bp]);
 
 		if (pBreakpointInfo == NULL)
 		{
-			DebugOutput("CAPEExceptionFilter: Can't get BreakpointInfo for thread %d\n", GetCurrentThreadId());
+			DebugOutput("CAPEExceptionFilter: Can't get BreakpointInfo for thread %d\n", CurrentThreadId);
 			return EXCEPTION_CONTINUE_EXECUTION;
 		}
 
@@ -543,27 +642,52 @@ LONG WINAPI CAPEExceptionFilter(struct _EXCEPTION_POINTERS* ExceptionInfo)
 
 		if (pBreakpointInfo->Callback == NULL)
 		{
-			DebugOutput("CAPEExceptionFilter: Can't find callback, passing exception (thread %d)\n", GetCurrentThreadId());
+			DebugOutput("CAPEExceptionFilter: Can't find callback, passing exception (thread %d)\n", CurrentThreadId);
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 		else
 		{
-			Handler = (BREAKPOINT_HANDLER)pBreakpointInfo->Callback;
-
-#ifdef DEBUG_COMMENTS
-			DebugOutput("CAPEExceptionFilter: About to call breakpoint handler at: 0x%p\n", Handler);
-#endif
 			// Invoke the handler
-			if (Handler)
-				Handler(pBreakpointInfo, ExceptionInfo);
+			if (pBreakpointInfo->Callback && !pBreakpointInfo->HandlerActive)
+			{
+				pBreakpointInfo->HandlerActive = TRUE;
+#ifdef DEBUG_COMMENTS
+				DebugOutput("CAPEExceptionFilter: About to call breakpoint handler at: 0x%p\n", pBreakpointInfo->Callback);
+#endif
+				((BREAKPOINT_HANDLER)pBreakpointInfo->Callback)(pBreakpointInfo, ExceptionInfo);
+				pBreakpointInfo->HandlerActive = FALSE;
+				ResumeFromBreakpoint(ExceptionInfo->ContextRecord);
+			}
 		}
 
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
+	else if (g_config.debugger && ExceptionInfo->ExceptionRecord->ExceptionCode == STATUS_BREAKPOINT && *(PBYTE)ExceptionInfo->ExceptionRecord->ExceptionAddress == 0xCC)
+	{
+		// Check to see if it's a software breakpoint and it's ours
+		if (lookup_get(&SoftBPs, (ULONG_PTR)ExceptionInfo->ExceptionRecord->ExceptionAddress, 0))
+		{
+#ifdef DEBUG_COMMENTS
+			DebugOutput("CAPEExceptionFilter: Software breakpoint at 0x%p\n", ExceptionInfo->ExceptionRecord->ExceptionAddress);
+#endif
+			if (SoftwareBreakpointHandler(ExceptionInfo))
+				return EXCEPTION_CONTINUE_EXECUTION;
+		}
+
+		// Is it a 'syscall' breakpoint
+		if (lookup_get(&SyscallBPs, (ULONG_PTR)ExceptionInfo->ExceptionRecord->ExceptionAddress, 0))
+		{
+#ifdef DEBUG_COMMENTS
+			DebugOutput("CAPEExceptionFilter: 'syscall' breakpoint at 0x%p\n", ExceptionInfo->ExceptionRecord->ExceptionAddress);
+#endif
+			if (SyscallBreakpointHandler(ExceptionInfo))
+				return EXCEPTION_CONTINUE_EXECUTION;
+		}
+	}
 	else if (ExceptionInfo->ExceptionRecord->ExceptionCode == STATUS_PRIVILEGED_INSTRUCTION || ExceptionInfo->ExceptionRecord->ExceptionCode == STATUS_ILLEGAL_INSTRUCTION)
 	{
-		_DecodedInst instruction;
 #ifdef _WIN64
+		_DecodedInst instruction;
 		if (ide(&instruction, (void*)ExceptionInfo->ContextRecord->Rip) && !stricmp("rdtscp", instruction.mnemonic.p)) {
 			if (g_config.nop_rdtscp)
 			{
@@ -600,6 +724,7 @@ LONG WINAPI CAPEExceptionFilter(struct _EXCEPTION_POINTERS* ExceptionInfo)
 #endif
 			return EXCEPTION_CONTINUE_EXECUTION;
 		}
+#ifdef DEBUG_COMMENTS
 #ifdef _WIN64
 		else if (ide(&instruction, (void*)ExceptionInfo->ContextRecord->Rip))
 			DebugOutput("RtlDispatchException: Unhandled privileged %s instruction at 0x%p\n", instruction.mnemonic.p, ExceptionInfo->ContextRecord->Rip);
@@ -610,6 +735,7 @@ LONG WINAPI CAPEExceptionFilter(struct _EXCEPTION_POINTERS* ExceptionInfo)
 			DebugOutput("RtlDispatchException: Unhandled privileged %s instruction at 0x%p\n", instruction.mnemonic.p, ExceptionInfo->ContextRecord->Eip);
 		else
 			DebugOutput("RtlDispatchException: Unhandled privileged instruction at 0x%p\n", ExceptionInfo->ContextRecord->Eip);
+#endif
 #endif
 	}
 
@@ -622,27 +748,45 @@ LONG WINAPI CAPEExceptionFilter(struct _EXCEPTION_POINTERS* ExceptionInfo)
 	if (TraceRunning)
 	{
 		unsigned int RVA;
-		DWORD ThreadId = GetCurrentThreadId();
 		char *ModuleName = convert_address_to_dll_name_and_offset((ULONG_PTR)ExceptionInfo->ExceptionRecord->ExceptionAddress, &RVA);
 		if (ModuleName)
 		{
 			if (!ExceptionInfo->ExceptionRecord->NumberParameters)
-				DebuggerOutput("\nException 0x%x at 0x%p in %s (RVA 0x%x, thread %d), flags 0x%x",ExceptionInfo->ExceptionRecord->ExceptionCode, ExceptionInfo->ExceptionRecord->ExceptionAddress, ModuleName, RVA, ThreadId, ExceptionInfo->ExceptionRecord->ExceptionFlags);
+				DebuggerOutput("\nException 0x%x at 0x%p in %s (RVA 0x%x, thread %d), flags 0x%x\n", ExceptionInfo->ExceptionRecord->ExceptionCode, ExceptionInfo->ExceptionRecord->ExceptionAddress, ModuleName, RVA, CurrentThreadId, ExceptionInfo->ExceptionRecord->ExceptionFlags);
 			else if (ExceptionInfo->ExceptionRecord->NumberParameters == 1)
-				DebuggerOutput("\nException 0x%x at 0x%p in %s (RVA 0x%x, thread %d), flags 0x%x, exception information 0x%p",ExceptionInfo->ExceptionRecord->ExceptionCode, ExceptionInfo->ExceptionRecord->ExceptionAddress, ModuleName, RVA, ThreadId, ExceptionInfo->ExceptionRecord->ExceptionFlags, ExceptionInfo->ExceptionRecord->ExceptionInformation[0]);
+				DebuggerOutput("\nException 0x%x at 0x%p in %s (RVA 0x%x, thread %d), flags 0x%x, exception information 0x%p\n", ExceptionInfo->ExceptionRecord->ExceptionCode, ExceptionInfo->ExceptionRecord->ExceptionAddress, ModuleName, RVA, CurrentThreadId, ExceptionInfo->ExceptionRecord->ExceptionFlags, ExceptionInfo->ExceptionRecord->ExceptionInformation[0]);
 			else if (ExceptionInfo->ExceptionRecord->NumberParameters == 2)
-				DebuggerOutput("\nException 0x%x at 0x%p in %s (RVA 0x%x, thread %d), flags 0x%x, exception information[0] 0x%p, exception information[1] 0x%p",ExceptionInfo->ExceptionRecord->ExceptionCode, ExceptionInfo->ExceptionRecord->ExceptionAddress, ModuleName, RVA, ThreadId, ExceptionInfo->ExceptionRecord->ExceptionFlags, ExceptionInfo->ExceptionRecord->ExceptionInformation[0], ExceptionInfo->ExceptionRecord->ExceptionInformation[1]);
+				DebuggerOutput("\nException 0x%x at 0x%p in %s (RVA 0x%x, thread %d), flags 0x%x, exception information[0] 0x%p, exception information[1] 0x%p\n", ExceptionInfo->ExceptionRecord->ExceptionCode, ExceptionInfo->ExceptionRecord->ExceptionAddress, ModuleName, RVA, CurrentThreadId, ExceptionInfo->ExceptionRecord->ExceptionFlags, ExceptionInfo->ExceptionRecord->ExceptionInformation[0], ExceptionInfo->ExceptionRecord->ExceptionInformation[1]);
 		}
 		else
 		{
 			if (!ExceptionInfo->ExceptionRecord->NumberParameters)
-				DebuggerOutput("\nException 0x%x at 0x%p, thread %d, flags 0x%x",ExceptionInfo->ExceptionRecord->ExceptionCode, ExceptionInfo->ExceptionRecord->ExceptionAddress, ThreadId, ExceptionInfo->ExceptionRecord->ExceptionFlags);
+				DebuggerOutput("\nException 0x%x at 0x%p, thread %d, flags 0x%x\n", ExceptionInfo->ExceptionRecord->ExceptionCode, ExceptionInfo->ExceptionRecord->ExceptionAddress, CurrentThreadId, ExceptionInfo->ExceptionRecord->ExceptionFlags);
 			else if (ExceptionInfo->ExceptionRecord->NumberParameters == 1)
-				DebuggerOutput("\nException 0x%x at 0x%p, thread %d, flags 0x%x, exception information 0x%p",ExceptionInfo->ExceptionRecord->ExceptionCode, ExceptionInfo->ExceptionRecord->ExceptionAddress, ThreadId, ExceptionInfo->ExceptionRecord->ExceptionFlags, ExceptionInfo->ExceptionRecord->ExceptionInformation[0]);
+				DebuggerOutput("\nException 0x%x at 0x%p, thread %d, flags 0x%x, exception information 0x%p\n", ExceptionInfo->ExceptionRecord->ExceptionCode, ExceptionInfo->ExceptionRecord->ExceptionAddress, CurrentThreadId, ExceptionInfo->ExceptionRecord->ExceptionFlags, ExceptionInfo->ExceptionRecord->ExceptionInformation[0]);
 			else if (ExceptionInfo->ExceptionRecord->NumberParameters == 2)
-				DebuggerOutput("\nException 0x%x at 0x%p, thread %d, flags 0x%x, exception information[0] 0x%p, exception information[1] 0x%p",ExceptionInfo->ExceptionRecord->ExceptionCode, ExceptionInfo->ExceptionRecord->ExceptionAddress, ThreadId, ExceptionInfo->ExceptionRecord->ExceptionFlags, ExceptionInfo->ExceptionRecord->ExceptionInformation[0], ExceptionInfo->ExceptionRecord->ExceptionInformation[1]);
+				DebuggerOutput("\nException 0x%x at 0x%p, thread %d, flags 0x%x, exception information[0] 0x%p, exception information[1] 0x%p\n", ExceptionInfo->ExceptionRecord->ExceptionCode, ExceptionInfo->ExceptionRecord->ExceptionAddress, CurrentThreadId, ExceptionInfo->ExceptionRecord->ExceptionFlags, ExceptionInfo->ExceptionRecord->ExceptionInformation[0], ExceptionInfo->ExceptionRecord->ExceptionInformation[1]);
 		}
+#ifdef _WIN64
+		DebuggerOutput(
+			"RAX 0x%I64x RBX 0x%I64x RCX 0x%I64x RDX 0x%I64x RSI 0x%I64x RDI 0x%I64x\nR8 0x%I64x R9 0x%I64x R10 0x%I64x R11 0x%I64x R12 0x%I64x R13 0x%I64x R14 0x%I64x R15 0x%I64x RSP 0x%I64x RBP 0x%I64x\n",
+			ExceptionInfo->ContextRecord->Rax, ExceptionInfo->ContextRecord->Rbx, ExceptionInfo->ContextRecord->Rcx, ExceptionInfo->ContextRecord->Rdx,
+			ExceptionInfo->ContextRecord->Rsi, ExceptionInfo->ContextRecord->Rdi, ExceptionInfo->ContextRecord->R8, ExceptionInfo->ContextRecord->R9,
+			ExceptionInfo->ContextRecord->R10, ExceptionInfo->ContextRecord->R11, ExceptionInfo->ContextRecord->R12, ExceptionInfo->ContextRecord->R13,
+			ExceptionInfo->ContextRecord->R14, ExceptionInfo->ContextRecord->R15, ExceptionInfo->ContextRecord->Rsp, ExceptionInfo->ContextRecord->Rbp
+			);
+#else
+		DebuggerOutput(
+			"EAX 0x%x EBX 0x%x ECX 0x%x EDX 0x%x ESI 0x%x EDI 0x%x ESP 0x%x EBP 0x%x\n",
+			ExceptionInfo->ContextRecord->Eax, ExceptionInfo->ContextRecord->Ebx, ExceptionInfo->ContextRecord->Ecx, ExceptionInfo->ContextRecord->Edx,
+			ExceptionInfo->ContextRecord->Esi, ExceptionInfo->ContextRecord->Edi, ExceptionInfo->ContextRecord->Esp, ExceptionInfo->ContextRecord->Ebp
+			);
+#endif
+		DoTraceOutput((PVOID)ExceptionInfo->ExceptionRecord->ExceptionAddress);
 	}
+
+	if (BreakpointsSet)
+		ContextClearDebugRegisters(ExceptionInfo->ContextRecord);
 
 	// Some other exception occurred. Pass it to next handler.
 	return EXCEPTION_CONTINUE_SEARCH;
@@ -835,7 +979,9 @@ BOOL SetDebugRegister
 
 	if (!GetThreadContext(hThread, &Context))
 	{
+#ifdef DEBUG_COMMENTS
 		ErrorOutput("SetDebugRegister: GetThreadContext failed (thread handle 0x%x)", hThread);
+#endif
 		return FALSE;
 	}
 
@@ -886,6 +1032,26 @@ BOOL SetDebugRegister
 		ErrorOutput("SetDebugRegister: SetThreadContext failed");
 		return FALSE;
 	}
+
+	return TRUE;
+}
+
+//**************************************************************************************
+BOOL ContextClearDebugRegisters(PCONTEXT Context)
+//**************************************************************************************
+{
+	if (!Context)
+	{
+		DebugOutput("ContextClearDebugRegisters - no context supplied.\n");
+		return FALSE;
+	}
+
+	Context->Dr0 = 0;
+	Context->Dr1 = 0;
+	Context->Dr2 = 0;
+	Context->Dr3 = 0;
+	Context->Dr6 = 0;
+	Context->Dr7 = 0;
 
 	return TRUE;
 }
@@ -1989,6 +2155,106 @@ BOOL ContextSetThreadBreakpoints(PCONTEXT ThreadContext, PTHREADBREAKPOINTS Thre
 }
 
 //**************************************************************************************
+BOOL SetSoftwareBreakpoint(LPVOID Address)
+//**************************************************************************************
+{
+	DWORD OldProtect;
+
+	if (!Address || !IsAddressAccessible(Address))
+		return FALSE;
+
+	if (lookup_get(&SoftBPs, (ULONG_PTR)Address, 0))
+	{
+#ifdef DEBUG_COMMENTS
+		DebugOutput("SetSoftwareBreakpoint: Address 0x%p already in software breakpoint list", Address);
+#endif
+		return FALSE;
+	}
+
+	BYTE InsByte = *(PBYTE)Address;
+	if (InsByte == 0xCC)
+	{
+#ifdef DEBUG_COMMENTS
+		DebugOutput("SetSoftwareBreakpoint: Address 0x%p already contains 0xCC byte", Address);
+#endif
+		return FALSE;
+	}
+
+	PBYTE pInsByte = lookup_add(&SoftBPs, (ULONG_PTR)Address, 0);
+	if (!pInsByte)
+	{
+		DebugOutput("SetSoftwareBreakpoint: Unable to store instruction byte at 0x%p", Address);
+		return FALSE;
+	}
+
+	*pInsByte = InsByte;
+#ifdef DEBUG_COMMENTS
+	DebugOutput("SetSoftwareBreakpoint: Instruction byte at 0x%p: 0x%x", Address, *pInsByte);
+#endif
+
+	if (!VirtualProtect(Address, 1, PAGE_EXECUTE_READWRITE, &OldProtect))
+	{
+		DebugOutput("SetSoftwareBreakpoint: Unable to change memory protection at 0x%p", Address);
+		return FALSE;
+	}
+
+#ifdef DEBUG_COMMENTS
+	DebugOutput("SetSoftwareBreakpoint: Changed memory protection at 0x%p", Address);
+#endif
+
+	*(PBYTE)Address = 0xCC;
+
+#ifdef DEBUG_COMMENTS
+	DebugOutput("SetSoftwareBreakpoint: New instruction byte at 0x%p: 0x%x", Address, *(PBYTE)Address);
+#endif
+	VirtualProtect(Address, 1, OldProtect, &OldProtect);
+
+	return TRUE;
+}
+
+//**************************************************************************************
+BOOL SetSyscallBreakpoint(LPVOID Address)
+//**************************************************************************************
+{
+	DWORD OldProtect;
+
+	if (!Address || !IsAddressAccessible(Address))
+		return FALSE;
+
+	if (GetAllocationBase(Address) == GetModuleHandle("ntdll"))
+		return FALSE;
+
+	if (lookup_get(&SyscallBPs, (ULONG_PTR)Address, 0))
+	{
+#ifdef DEBUG_COMMENTS
+		DebugOutput("SetSoftwareBreakpoint: Address 0x%p already in software breakpoint list", Address);
+#endif
+		return FALSE;
+	}
+
+	lookup_add(&SyscallBPs, (ULONG_PTR)Address, 0);
+
+	if (!VirtualProtect(Address, 1, PAGE_EXECUTE_READWRITE, &OldProtect))
+	{
+		DebugOutput("SetSoftwareBreakpoint: Unable to change memory protection at 0x%p", Address);
+		return FALSE;
+	}
+
+#ifdef DEBUG_COMMENTS
+	DebugOutput("SetSoftwareBreakpoint: Changed memory protection at 0x%p", Address);
+#endif
+
+	*(PBYTE)Address = 0xCC;
+
+#ifdef DEBUG_COMMENTS
+	DebugOutput("SetSoftwareBreakpoint: New instruction byte at 0x%p: 0x%x", Address, *(PBYTE)Address);
+#endif
+	VirtualProtect(Address, 1, OldProtect, &OldProtect);
+
+	return TRUE;
+}
+
+//**************************************************************************************
 BOOL SetThreadBreakpoint
 //**************************************************************************************
 (
@@ -2333,15 +2599,13 @@ BOOL InitialiseDebugger(void)
 	if (DebuggerInitialised)
 		return TRUE;
 
-	MainThreadId = GetCurrentThreadId();
-
 	if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &MainThreadHandle, 0, FALSE, DUPLICATE_SAME_ACCESS) == 0)
 	{
 		DebugOutput("InitialiseDebugger: Failed to duplicate thread handle.\n");
 		return FALSE;
 	}
 
-	MainThreadBreakpointList = CreateThreadBreakpoints(MainThreadId, NULL);
+	MainThreadBreakpointList = CreateThreadBreakpoints(GetCurrentThreadId(), NULL);
 
 	if (MainThreadBreakpointList == NULL)
 	{
@@ -2419,7 +2683,9 @@ void NtContinueHandler(PCONTEXT ThreadContext)
 		PTHREADBREAKPOINTS ThreadBreakpoints = GetThreadBreakpoints(ThreadId);
 		if (ThreadBreakpoints)
 		{
+#ifdef DEBUG_COMMENTS
 			DebugOutput("NtContinue hook: restoring breakpoints for thread %d.\n", ThreadId);
+#endif
 			ContextSetThreadBreakpointsEx(ThreadContext, ThreadBreakpoints, TRUE);
 #ifndef _WIN64
 			if (BreakOnNtContinue) {

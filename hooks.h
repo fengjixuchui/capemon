@@ -466,6 +466,20 @@ HOOKDEF(LONG, WINAPI, RegDeleteKeyW,
 	__in  LPWSTR lpSubKey
 );
 
+HOOKDEF(LSTATUS, WINAPI, RegDeleteKeyExW,
+	_In_ HKEY    hKey,
+	_In_ LPCWSTR lpSubKey,
+	_In_ REGSAM  samDesired,
+	__reserved  DWORD Reserved
+);
+
+HOOKDEF(LSTATUS, WINAPI, RegDeleteKeyExA,
+	_In_ HKEY   hKey,
+	_In_ LPCSTR lpSubKey,
+	_In_ REGSAM samDesired,
+	__reserved  DWORD Reserved
+);
+
 HOOKDEF(LONG, WINAPI, RegEnumKeyW,
 	__in   HKEY hKey,
 	__in   DWORD dwIndex,
@@ -815,6 +829,20 @@ HOOKDEF(BOOL, WINAPI, PostMessageW,
 	_In_  LPARAM lParam
 );
 
+HOOKDEF(BOOL, WINAPI, PostThreadMessageA,
+		_In_  DWORD idThread,
+		_In_  UINT Msg,
+		_In_  WPARAM wParam,
+		_In_  LPARAM lParam
+);
+
+HOOKDEF(BOOL, WINAPI, PostThreadMessageW,
+			_In_  DWORD idThread,
+			_In_  UINT Msg,
+			_In_  WPARAM wParam,
+			_In_  LPARAM lParam
+);
+
 HOOKDEF(BOOL, WINAPI, SendMessageA,
 	_In_  HWND hWnd,
 	_In_  UINT Msg,
@@ -981,6 +1009,11 @@ HOOKDEF(BOOL, WINAPI, Module32NextW,
 	__out LPMODULEENTRY32W lpme
 );
 
+HOOKDEF(UINT, WINAPI, WinExec,
+	__in LPCSTR lpCmdLine,
+	__in UINT   uCmdShow
+);
+
 HOOKDEF(NTSTATUS, WINAPI, NtCreateProcess,
 	__out	   PHANDLE ProcessHandle,
 	__in		ACCESS_MASK DesiredAccess,
@@ -1044,6 +1077,14 @@ HOOKDEF(NTSTATUS, WINAPI, NtOpenProcessToken,
 	__out PHANDLE TokenHandle
 );
 
+HOOKDEF(NTSTATUS, WINAPI, NtQueryInformationToken,
+	IN HANDLE TokenHandle,
+	IN TOKEN_INFORMATION_CLASS TokenInformationClass,
+	OUT PVOID TokenInformation,
+	IN ULONG TokenInformationLength,
+	OUT PULONG ReturnLength OPTIONAL
+);
+
 HOOKDEF(NTSTATUS, WINAPI, NtTerminateProcess,
 	__in_opt  HANDLE ProcessHandle,
 	__in	  NTSTATUS ExitStatus
@@ -1090,6 +1131,32 @@ HOOKDEF(NTSTATUS, WINAPI, NtOpenSection,
 	__out  PHANDLE SectionHandle,
 	__in   ACCESS_MASK DesiredAccess,
 	__in   POBJECT_ATTRIBUTES ObjectAttributes
+);
+
+HOOKDEF(BOOL, WINAPI, CreateProcessA,
+	__in_opt	LPCSTR lpApplicationName,
+	__inout_opt LPSTR lpCommandLine,
+	__in_opt	LPSECURITY_ATTRIBUTES lpProcessAttributes,
+	__in_opt	LPSECURITY_ATTRIBUTES lpThreadAttributes,
+	__in		BOOL bInheritHandles,
+	__in		DWORD dwCreationFlags,
+	__in_opt	LPVOID lpEnvironment,
+	__in_opt	LPCSTR lpCurrentDirectory,
+	__in		LPSTARTUPINFOA lpStartupInfo,
+	__out	    LPPROCESS_INFORMATION lpProcessInformation
+);
+
+HOOKDEF(BOOL, WINAPI, CreateProcessW,
+	__in_opt	LPWSTR lpApplicationName,
+	__inout_opt LPWSTR lpCommandLine,
+	__in_opt	LPSECURITY_ATTRIBUTES lpProcessAttributes,
+	__in_opt	LPSECURITY_ATTRIBUTES lpThreadAttributes,
+	__in		BOOL bInheritHandles,
+	__in		DWORD dwCreationFlags,
+	__in_opt	LPVOID lpEnvironment,
+	__in_opt	LPWSTR lpCurrentDirectory,
+	__in		LPSTARTUPINFOW lpStartupInfo,
+	__out	    LPPROCESS_INFORMATION lpProcessInformation
 );
 
 HOOKDEF(BOOL, WINAPI, CreateProcessInternalW,
@@ -1215,6 +1282,12 @@ HOOKDEF(NTSTATUS, WINAPI, NtQueryInformationProcess,
 	OUT PVOID ProcessInformation,
 	IN ULONG ProcessInformationLength,
 	OUT PULONG ReturnLength OPTIONAL
+);
+
+HOOKDEF(HMODULE, WINAPI, LoadLibraryExW,
+	__in	  LPCWSTR lpLibFileName,
+	__in	  HANDLE  hFile,
+	__in	  DWORD   dwFlags
 );
 
 HOOKDEF(NTSTATUS, WINAPI, NtAllocateVirtualMemory,
@@ -1354,7 +1427,7 @@ HOOKDEF(NTSTATUS, WINAPI, NtQueueApcThread,
 	__in PIO_APC_ROUTINE ApcRoutine,
 	__in_opt PVOID ApcRoutineContext,
 	__in_opt PIO_STATUS_BLOCK ApcStatusBlock,
-	__in_opt ULONG ApcReserved
+	__in_opt PVOID ApcReserved
 );
 
 HOOKDEF(NTSTATUS, WINAPI, NtQueueApcThreadEx,
@@ -1401,6 +1474,11 @@ HOOKDEF(NTSTATUS, WINAPI, NtOpenThread,
 HOOKDEF(NTSTATUS, WINAPI, NtGetContextThread,
 	__in	 HANDLE ThreadHandle,
 	__inout  LPCONTEXT Context
+);
+
+HOOKDEF(NTSTATUS, WINAPI, RtlWow64GetThreadContext,
+	__in	 HANDLE ThreadHandle,
+	__inout  PWOW64_CONTEXT Context
 );
 
 HOOKDEF(NTSTATUS, WINAPI, NtSetContextThread,
@@ -1718,6 +1796,12 @@ HOOKDEF(BOOL, WINAPI, GetComputerNameA,
 HOOKDEF(BOOL, WINAPI, GetComputerNameW,
 	_Out_	PCWSTR lpBuffer,
 	_Inout_  LPDWORD lpnSize
+);
+
+HOOKDEF(BOOL, WINAPI, GetComputerNameExW,
+	__in	int NameType,
+	__out	LPWSTR lpBuffer,
+	__out	LPDWORD nSize
 );
 
 HOOKDEF(BOOL, WINAPI, GetUserNameA,
@@ -3408,4 +3492,32 @@ HOOKDEF(LPWSTR, WINAPI, GetCommandLineW,
 
 HOOKDEF(BOOL, WINAPI, DisableThreadLibraryCalls,
 	__in HMODULE hLibModule
+);
+
+HOOKDEF(UINT, WINAPI, GetWriteWatch,
+	__in		DWORD		dwFlags,
+	__in		PVOID		lpBaseAddress,
+	__in		SIZE_T		dwRegionSize,
+	__out		PVOID*		lpAddresses,
+	__inout		ULONG_PTR*	lpdwCount,
+	__out		LPDWORD		lpdwGranularity
+);
+
+HOOKDEF(BOOL, WINAPI, UpdateProcThreadAttribute,
+	__inout		LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList,
+	__in		DWORD		dwFlags,
+	__in		DWORD_PTR	Attribute,
+	__in		PVOID		lpValue,
+	__in		SIZE_T		cbSize,
+	__out_opt	PVOID		lpPreviousValue,
+	__in_opt	PSIZE_T		lpReturnSize
+);
+
+HOOKDEF(int, WINAPI, compileMethod,
+	PVOID			this,
+	PVOID			compHnd,
+	PVOID			methodInfo,
+	unsigned int	flags,
+	uint8_t**		entryAddress,
+	uint32_t*		nativeSizeOfCode
 );

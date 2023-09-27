@@ -20,20 +20,21 @@ along with this program.If not, see <http://www.gnu.org/licenses/>.
 #include <windows.h>
 #include "Shlwapi.h"
 #include "CAPE.h"
+#include "Debugger.h"
 #include "YaraHarness.h"
 #include "..\config.h"
 
 extern void DebugOutput(_In_ LPCTSTR lpOutputString, ...);
 extern void ErrorOutput(_In_ LPCTSTR lpOutputString, ...);
-extern BOOL SetInitialBreakpoints(PVOID ImageBase);
+extern BOOL SetInitialBreakpoints(PVOID ImageBase), DumpRegion(PVOID Address);
 extern void parse_config_line(char* line);
-extern BOOL DumpRegion(PVOID Address);
 extern int ReverseScanForNonZero(PVOID Buffer, SIZE_T Size);
 extern SIZE_T GetAccessibleSize(PVOID Buffer);
 extern char *our_dll_path;
+extern BOOL BreakpointsHit;
 
 YR_RULES* Rules = NULL;
-BOOL YaraActivated, YaraLogging;
+BOOL YaraActivated, YaraLogging, CapemonRulesDetected;
 #ifdef _WIN64
 extern PVOID LdrpInvertedFunctionTableSRWLock;
 #endif
@@ -45,11 +46,14 @@ char InternalYara[] =
 	"{strings:$10_0_19041_662 = {48 8D 0D [4] E8 [4] [7] 8B 44 24 ?? 44 8B CB 4C 8B 44 24 ?? 48 8B D7 89 44 24 ?? E8}"
 	"$10_0_18362_1350 = {48 8D 0D [4] 33 D2 85 C0 48 0F 48 DA E8 [4] 33 C9 E8 [4] 8B 44 24 ?? 44 8B CF 4C 8B C3 89 44 24 ?? 48 8B D6 E8}"
 	"$10_0_10240_16384 = {48 8D 0D [4] 48 8B E8 E8 [4] 33 C9 E8 [4] 8B 15 [4] 3B 15 [4] 0F 84}"
-	"condition:uint16(0) == 0x5a4d and any of them}";
+	"condition:uint16(0) == 0x5a4d and any of them}"
+	"rule capemon"
+	"{strings:$hash = {d3 b9 46 1d 9a 14 bc 44 a1 61 c3 47 6a 0e 35 90 00 2c 28 81 dc a0 36 dc 2c 92 0c 7c b6 84 39 59}"
+	"condition:all of them}";
 
 BOOL ParseOptionLine(char* Line, char* Identifier, PVOID Target)
 {
-	char *Value, *Key, *p, *q;
+	char *Value, *Key, *p, *q, *r, c = 0;
 	unsigned int ValueLength;
 	int delta=0;
 	if (!Line || !Identifier)
@@ -60,7 +64,11 @@ BOOL ParseOptionLine(char* Line, char* Identifier, PVOID Target)
 	p = strchr(Line, '=');
 	if (!p)
 		return FALSE;
-	Value = p + 1;
+	r = strchr(p, ':');
+	if (r)
+		Value = r + 1;
+	else
+		Value = p + 1;
 	q = strchr(Value, '+');
 	if (q)
 		delta = strtoul(q+1, NULL, 0);
@@ -79,10 +87,23 @@ BOOL ParseOptionLine(char* Line, char* Identifier, PVOID Target)
 		return FALSE;
 
 	Key = Line;
-	*p = 0;
+	if (r) {
+		c = *r;
+		*r = 0;
+	}
+	else {
+		c = *p;
+		*p = 0;
+	}
 	memset(NewLine, 0, sizeof(NewLine));
-	sprintf(NewLine, "%s=0x%p\0", Key, (PUCHAR)Target+delta);
-	*p = '=';
+	sprintf(NewLine, "%s%c0x%p\0", Key, c, (PUCHAR)Target+delta);
+	if (r)
+		*r = c;
+	else
+		*p = c;
+	p = strchr(NewLine, '$');
+	if (p)
+		return FALSE;
 	return TRUE;
 }
 
@@ -134,12 +155,23 @@ int YaraCallback(YR_SCAN_CONTEXT* context, int message, void* message_data, void
 								}
 							}
 						}
-#ifdef DEBUG_COMMENTS
-						DebugOutput("YaraScan hit: parse_config_line %s", OptionLine);
-#endif
+
 						if (!_stricmp("dump", OptionLine))
 							DoDumpRegion = TRUE;
-						parse_config_line(OptionLine);
+						if (!_stricmp("clear", OptionLine))
+						{
+							BreakpointsHit = FALSE;
+							g_config.bp0 = NULL;
+							g_config.bp1 = NULL;
+							g_config.bp2 = NULL;
+							g_config.bp3 = NULL;
+							g_config.br0 = NULL;
+							g_config.br1 = NULL;
+							g_config.br2 = NULL;
+							g_config.br3 = NULL;
+						}
+						if (!strchr(OptionLine, '$'))
+							parse_config_line(OptionLine);
 						if (p)
 						{
 							*p = ',';
@@ -151,7 +183,7 @@ int YaraCallback(YR_SCAN_CONTEXT* context, int message, void* message_data, void
 				}
 			}
 
-			if (SetBreakpoints)
+			if (DebuggerInitialised && SetBreakpoints)
 				SetInitialBreakpoints(user_data);
 
 			if (DoDumpRegion)
@@ -181,7 +213,8 @@ int InternalYaraCallback(YR_SCAN_CONTEXT* context, int message, void* message_da
 			YR_STRING* String;
 			YR_RULE* Rule = (YR_RULE*)message_data;
 
-			DebugOutput("InternalYaraScan hit: %s\n", Rule->identifier);
+			if (YaraLogging)
+				DebugOutput("InternalYaraScan hit: %s\n", Rule->identifier);
 
 			yr_rule_strings_foreach(Rule, String)
 			{
@@ -198,6 +231,9 @@ int InternalYaraCallback(YR_SCAN_CONTEXT* context, int message, void* message_da
 						}
 					}
 #endif
+					if (!strcmp(Rule->identifier, "capemon"))
+						if (!strcmp(String->identifier, "$hash"))
+							CapemonRulesDetected = TRUE;
 				}
 			}
 			return CALLBACK_CONTINUE;
@@ -254,7 +290,12 @@ void YaraScan(PVOID Address, SIZE_T Size)
 	SIZE_T AccessibleSize = GetAccessibleSize(Address);
 
 	if (!AccessibleSize)
+	{
+#ifdef DEBUG_COMMENTS
+		DebugOutput("YaraScan: Memory at 0x%p is inaccessible.\n", Address);
+#endif
 		return;
+	}
 
 	if (AccessibleSize < Size)
 		Size = AccessibleSize;
@@ -268,7 +309,9 @@ void YaraScan(PVOID Address, SIZE_T Size)
 		return;
 	}
 
+#ifndef DEBUG_COMMENTS
 	if (YaraLogging)
+#endif
 		DebugOutput("YaraScan: Scanning 0x%p, size 0x%x\n", Address, Size);
 
 	__try
@@ -285,6 +328,18 @@ void YaraScan(PVOID Address, SIZE_T Size)
 #ifdef DEBUG_COMMENTS
 	else
 		DebugOutput("YaraScan: successfully scanned 0x%p\n", Address);
+#endif
+}
+
+void SilentYaraScan(PVOID Address, SIZE_T Size)
+{
+#ifndef DEBUG_COMMENTS
+	BOOL PreviousYaraLogging = YaraLogging;
+	YaraLogging = FALSE;
+#endif
+	YaraScan(Address, Size);
+#ifndef DEBUG_COMMENTS
+	YaraLogging = PreviousYaraLogging;
 #endif
 }
 
@@ -310,27 +365,40 @@ void InternalYaraScan(PVOID Address, SIZE_T Size)
 
 	if (!Size)
 	{
-		DebugOutput("InternalYaraScan: Nothing to scan at 0x%p!\n", Address);
+		if (YaraLogging)
+			DebugOutput("InternalYaraScan: Nothing to scan at 0x%p!\n", Address);
 		return;
 	}
 
-	DebugOutput("InternalYaraScan: Scanning 0x%p, size 0x%x\n", Address, Size);
+	if (YaraLogging)
+		DebugOutput("InternalYaraScan: Scanning 0x%p, size 0x%x\n", Address, Size);
 
 	__try
 	{
-		Result = yr_rules_scan_mem(Rules, Address, AccessibleSize, Flags, InternalYaraCallback, Address, Timeout);
+		Result = yr_rules_scan_mem(Rules, Address, Size, Flags, InternalYaraCallback, Address, Timeout);
 	}
 	__except(EXCEPTION_EXECUTE_HANDLER)
 	{
-		DebugOutput("InternalYaraScan: Unable to scan 0x%p\n", Address);
+		if (YaraLogging)
+			DebugOutput("InternalYaraScan: Unable to scan 0x%p\n", Address);
 		return;
 	}
-	if (Result != ERROR_SUCCESS)
+	if (Result != ERROR_SUCCESS && YaraLogging)
 		ScannerError(Result);
 #ifdef DEBUG_COMMENTS
 	else
 		DebugOutput("InternalYaraScan: successfully scanned 0x%p\n", Address);
 #endif
+}
+
+BOOL ScanForRulesCanary(PVOID Address, SIZE_T Size)
+{
+	BOOL PreviousYaraLogging = YaraLogging;
+	YaraLogging = FALSE;
+	CapemonRulesDetected = FALSE;
+	InternalYaraScan(Address, Size);
+	YaraLogging = PreviousYaraLogging;
+	return CapemonRulesDetected;
 }
 
 BOOL YaraInit()
@@ -362,7 +430,10 @@ BOOL YaraInit()
 		else if (Result == ERROR_COULD_NOT_OPEN_FILE)
 			DebugOutput("YaraInit: Unable to load existing compiled rules file %s\n", compiled_rules);
 		else
+		{
+			DebugOutput("YaraInit: Error loading existing compiled rules file %s\n", compiled_rules);
 			ScannerError(Result);
+		}
 	}
 	else
 	{
@@ -372,52 +443,58 @@ BOOL YaraInit()
 			goto exit;
 		}
 
-		char FindString[MAX_PATH];
-		WIN32_FIND_DATA FindFileData;
-		sprintf(FindString, "%s\\*.yar", yara_dir);
-#ifdef DEBUG_COMMENTS
-		DebugOutput("YaraInit: Yara search string: %s", FindString);
-#endif
-		HANDLE hFind = FindFirstFile(FindString, &FindFileData);
-		if (hFind != INVALID_HANDLE_VALUE)
+		if (g_config.yarascan)
 		{
-			unsigned int count = 0;
-			do
-			{
-				snprintf(file_name, sizeof(file_name), "%s\\%s", yara_dir, FindFileData.cFileName);
-
-				if (!(FindFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
-				{
-					rule_file = fopen(file_name, "r");
-
-					if (rule_file)
-					{
-						int errors = yr_compiler_add_file(Compiler, rule_file, NULL, file_name);
-
-						if (errors == ERROR_COULD_NOT_OPEN_FILE)
-							DebugOutput("YaraInit: Unable to open file %s\n", file_name);
-						else if (errors)
-							ScannerError(errors);
-						else
-						{
-							count++;
+			char FindString[MAX_PATH];
+			WIN32_FIND_DATA FindFileData;
+			sprintf(FindString, "%s\\*.yar", yara_dir);
 #ifdef DEBUG_COMMENTS
-							DebugOutput("YaraInit: Compiled rule file %s\n", file_name);
+			DebugOutput("YaraInit: Yara search string: %s", FindString);
 #endif
-						}
+			HANDLE hFind = FindFirstFile(FindString, &FindFileData);
+			if (hFind != INVALID_HANDLE_VALUE)
+			{
+				unsigned int count = 0;
+				do
+				{
+					snprintf(file_name, sizeof(file_name), "%s\\%s", yara_dir, FindFileData.cFileName);
 
-						fclose(rule_file);
+					if (!(FindFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+					{
+						rule_file = fopen(file_name, "r");
+
+						if (rule_file)
+						{
+							int errors = yr_compiler_add_file(Compiler, rule_file, NULL, file_name);
+
+							if (errors == ERROR_COULD_NOT_OPEN_FILE)
+								DebugOutput("YaraInit: Unable to open file %s\n", file_name);
+							else if (errors)
+							{
+								DebugOutput("YaraInit: Unable to compile rule file %s\n", file_name);
+								ScannerError(errors);
+							}
+							else
+							{
+								count++;
+#ifdef DEBUG_COMMENTS
+								DebugOutput("YaraInit: Compiled rule file %s\n", file_name);
+#endif
+							}
+
+							fclose(rule_file);
+						}
 					}
 				}
+				while (FindNextFile(hFind, &FindFileData));
+
+				FindClose(hFind);
+
+				DebugOutput("YaraInit: Compiled %d rule files\n", count);
 			}
-			while (FindNextFile(hFind, &FindFileData));
-
-			FindClose(hFind);
-
-			DebugOutput("YaraInit: Compiled %d rule files\n", count);
+			else
+				DebugOutput("YaraInit: Found no Yara rules in %s\n", yara_dir);
 		}
-		else
-			DebugOutput("YaraInit: Found no Yara rules in %s\n", yara_dir);
 
 		// Add 'internal' yara
 		if (yr_compiler_add_string(Compiler, InternalYara, NULL) != 0)
@@ -431,12 +508,15 @@ BOOL YaraInit()
 			goto exit;
 		}
 
-		Result = yr_rules_save(Rules, compiled_rules);
+		if (g_config.yarascan)
+		{
+			Result = yr_rules_save(Rules, compiled_rules);
 
-		if (Result != ERROR_SUCCESS)
-			ScannerError(Result);
-		else
-			DebugOutput("YaraInit: Compiled rules saved to file %s\n", compiled_rules);
+			if (Result != ERROR_SUCCESS)
+				ScannerError(Result);
+			else
+				DebugOutput("YaraInit: Compiled rules saved to file %s\n", compiled_rules);
+		}
 
 		yr_compiler_destroy(Compiler);
 	}

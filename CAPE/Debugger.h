@@ -74,6 +74,7 @@ typedef struct BreakpointInfo
 	DWORD			Type;
 	unsigned int	HitCount;
 	LPVOID			Callback;
+	BOOL			HandlerActive;
 } BREAKPOINTINFO, *PBREAKPOINTINFO;
 
 typedef BOOL (cdecl *BREAKPOINT_HANDLER)(PBREAKPOINTINFO, struct _EXCEPTION_POINTERS*);
@@ -124,6 +125,8 @@ BOOL ContextSetNextAvailableBreakpoint(PCONTEXT Context, int* Register, int Size
 BOOL SetNextAvailableBreakpoint(DWORD ThreadId, int* Register, int Size, LPVOID Address, DWORD Type, unsigned int HitCount, PVOID Callback);
 BOOL ContextUpdateCurrentBreakpoint(PCONTEXT Context, int Size, LPVOID Address, DWORD Type, unsigned int HitCount, PVOID Callback);
 BOOL SetThreadBreakpoints(PTHREADBREAKPOINTS ThreadBreakpoints);
+BOOL SetSoftwareBreakpoint(LPVOID Address);
+BOOL SetSyscallBreakpoint(LPVOID Address);
 
 BOOL SetSingleStepMode(PCONTEXT Context, PVOID Handler);
 BOOL SetResumeFlag(PCONTEXT Context);
@@ -157,6 +160,7 @@ BOOL ClearAllBreakpoints();
 BOOL ContextClearBreakpoint(PCONTEXT Context, int Register);
 BOOL ContextClearCurrentBreakpoint(PCONTEXT Context);
 BOOL ContextClearAllBreakpoints(PCONTEXT Context);
+BOOL ContextClearDebugRegisters(PCONTEXT Context);
 BOOL ClearSingleStepMode(PCONTEXT Context);
 
 // Misc
